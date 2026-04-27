@@ -27,7 +27,65 @@ __all__ = ["BaseRollout"]
 
 
 class BaseRollout(ABC):
-    """Base class for rollout."""
+    """Four-method contract every rollout backend implements.
+
+    What:
+
+      - The veRL-specific abstraction that unifies vLLM / SGLang / TRT-LLM /
+        HF / Naive inference engines behind a single interface.
+      - Four methods form the contract:
+          * ``generate_sequences`` — sync batch inference, used by classical
+            PPO trainers that expect a blocking call returning a DataProto.
+          * ``update_weights`` — stream new actor weights into the inference
+            engine after each training step (HybridEngine reshard hook).
+          * ``resume`` — wake GPU memory (weights and/or kv_cache) from the
+            sleep state so generation can proceed.
+          * ``release`` — put the inference engine to sleep, freeing GPU
+            memory back to the training side.
+
+    Lifecycle:
+
+      - Instantiated inside each rollout worker (see ``engine_workers.py``
+        Phase 3 build) with a ``RolloutConfig`` + ``HFModelConfig`` +
+        ``DeviceMesh`` describing the TP/DP shard this replica owns.
+      - Per PPO iteration the Sharding Manager drives the sleep/wake cycle:
+        ``resume(weights) -> update_weights(stream) -> resume(kv_cache) ->
+        generate_sequences -> release``.
+      - ``release`` returns GPU memory so FSDP / Megatron training shards
+        can reclaim it on the same devices (HybridEngine co-location).
+
+    Called by:
+
+      - ``verl/workers/engine_workers.py`` — owns ``self.rollout`` and
+        wires it into the training actor worker.
+      - ``verl/checkpoint_engine/base.py`` — uses the ``BaseRollout`` as
+        the ``server_adapter`` target for weight transfer.
+      - ``verl/trainer/ppo/ray_trainer.py`` — indirectly, via the Ray
+        actor group that wraps these workers.
+
+    Call graph:
+
+      - Concrete subclasses: ``NaiveRollout``, ``HFRollout``, and the
+        async ``ServerAdapter`` variants under
+        ``vllm_rollout`` / ``sglang_rollout`` / ``trtllm_rollout``.
+      - ``get_rollout_class`` below picks the class at runtime from
+        ``_ROLLOUT_REGISTRY``.
+
+    Why:
+
+      - Thin ABC on purpose: the heavy lifting (paged kv cache, continuous
+        batching, TP communicator) lives inside each backend; veRL only
+        needs a uniform seam for the Sharding Manager to call into.
+      - ``resume`` / ``release`` correspond to HybridFlow §4 3D-HybridEngine
+        sleep-wake: training and rollout share GPUs, so memory must be
+        yielded between phases rather than statically partitioned.
+      - ``update_weights`` takes a streaming generator (not a full state
+        dict) so the reshard can overlap transfer with consumption and
+        avoid materializing 2x weights on the rollout side.
+      - ``generate_sequences`` stays sync to keep the classical PPO path
+        simple; async backends expose an ``ServerAdapter`` that wraps
+        the same interface for the agent-loop path.
+    """
 
     def __init__(
         self,
@@ -43,10 +101,32 @@ class BaseRollout(ABC):
 
     @abstractmethod
     async def resume(self, tags: list[str]):
-        """Resume rollout weights or kv cache in GPU memory.
+        """Wake the inference engine from the sleep state.
 
-        Args:
-            tags: weights or kv_cache.
+        What:
+
+          - Re-materializes one or both of {``weights``, ``kv_cache``}
+            on GPU so that ``generate_sequences`` can execute.
+
+        Lifecycle:
+
+          - Called at the start of each rollout phase by the Sharding
+            Manager, typically twice: once with ``["weights"]`` before
+            ``update_weights``, and once with ``["kv_cache"]`` right
+            before generation.
+
+        Branches:
+
+          - ``tags`` controls which pools are resumed; callers may pass
+            a subset so weights can be updated while the kv cache stays
+            freed (the kv cache is the larger allocation).
+
+        Why:
+
+          - Paired with ``release`` to implement HybridFlow §4
+            3D-HybridEngine sleep-wake: the rollout engine yields its
+            memory between PPO iterations so colocated training shards
+            can use the same GPUs.
         """
         pass
 
@@ -56,26 +136,93 @@ class BaseRollout(ABC):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         **kwargs,
     ):
-        """Update the weights of the rollout model.
+        """Stream fresh actor weights into the inference engine.
 
-        Args:
-            weights: A generator that yields the name of the weight tensor and the tensor itself.
+        What:
+
+          - Replaces the rollout-side model parameters with the latest
+            training-side values after each PPO update step.
+
+        Lifecycle:
+
+          - Invoked by the Sharding Manager between training and
+            generation phases, after ``resume(["weights"])``.
+
+        Called by:
+
+          - The weight-transfer path inside
+            ``verl/workers/engine_workers.py`` and the checkpoint
+            engine's ``server_adapter`` flow.
+
+        Why:
+
+          - Takes a streaming generator (name, tensor) rather than a
+            full state dict so transfer and engine-side loading can
+            overlap, avoiding a peak of 2x weight memory on the
+            rollout shard.
+          - Central to HybridFlow §4 3D-HybridEngine: training may use
+            FSDP/Megatron sharding while rollout uses a different TP
+            layout, so the generator is the natural place to do the
+            per-parameter reshard/all-gather.
         """
         pass
 
     @abstractmethod
     async def release(self):
-        """Release weights and kv cache in GPU memory."""
+        """Put the inference engine to sleep, freeing GPU memory.
+
+        What:
+
+          - Releases both weights and kv cache pools back to the
+            allocator so colocated training shards can use the HBM.
+
+        Lifecycle:
+
+          - Called at the end of each rollout phase, after all
+            ``generate_sequences`` calls for the current PPO iteration
+            have returned.
+
+        Why:
+
+          - Counterpart to ``resume``; implements the sleep half of
+            the HybridFlow §4 3D-HybridEngine sleep-wake cycle.
+          - Without this, rollout memory (often tens of GB for the
+            paged kv cache) would stay pinned during the backward /
+            optimizer step and starve training.
+        """
         pass
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Batch generate sequences in sync mode.
+        """Blocking batch inference entry point for classical PPO.
 
-        Args:
-            prompts: The input prompts.
+        What:
 
-        Returns:
-            The output sequences.
+          - Takes a batch of prompts and returns the generated
+            continuations as a ``DataProto``, synchronously.
+
+        Lifecycle:
+
+          - Called from the rollout phase of the PPO trainer loop
+            after ``update_weights`` and the kv-cache resume.
+
+        Called by:
+
+          - The sync rollout path used by ``verl/trainer/ppo/ray_trainer``
+            for non-agent workloads (e.g. ``NaiveRollout``, ``HFRollout``).
+
+        Branches:
+
+          - ``NotImplementedError`` on the base class: async
+            ``ServerAdapter`` backends deliberately do not implement
+            this and expose an agent-loop API instead.
+
+        Why:
+
+          - Keeping the sync signature on the ABC lets the classical
+            PPO trainer treat rollout as a plain function call, while
+            the async server backends route generation through their
+            own event-loop schedulers for better throughput under
+            continuous batching.
         """
         raise NotImplementedError
 

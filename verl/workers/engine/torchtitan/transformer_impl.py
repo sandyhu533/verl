@@ -71,10 +71,60 @@ device_name = get_device_name()
 
 class TorchTitanEngine(BaseEngine):
     """
-    Concrete Engine implementation using PyTorch TorchTitan parallelism.
+    BaseEngine implementation backed by PyTorch / TorchTitan native parallelism
+    (TP + PP + FSDP2 + Context Parallel), DTensor-first.
 
-    Supports model sharding with FSDP2, tensor parallelism, activation/optimizer offloading,
-    LoRA, and sequence parallelism following the TorchTitan design.
+    What:
+
+    - Wraps a HF/TorchTitan transformer under verl's BaseEngine protocol so actor /
+      critic / reward workers drive it through the standard surface (initialize /
+      train_mode / eval_mode / forward_backward_batch / optimizer_step /
+      lr_scheduler_step / shard_data / unshard_data).
+    - Owns the DTensor device mesh (DP x TP x PP x CP), the FSDP2-wrapped module,
+      the optimizer, and offload policies for params / grads / optimizer states.
+
+    Lifecycle:
+
+    - __init__ builds the device mesh and offload flags; initialize() loads weights,
+      applies TP / FSDP2 / CP plans, and constructs optimizer + scheduler.
+    - train_mode / eval_mode are context managers toggling grad + activation recompute
+      and reloading offloaded state back to device.
+
+    Called by:
+
+    - EngineRegistry.new(..., strategy="torchtitan") via verl/workers/engine/base.py.
+    - TrainingWorker in verl/workers/engine/engine_workers.py composes THIS ENTITY into
+      actor / critic / reward roles.
+
+    Call graph (THIS ENTITY):
+
+    - forward_backward_batch -> per-microbatch forward -> loss -> backward; when PP > 1
+      delegates to a TorchTitan pipeline schedule runner.
+    - optimizer_step -> DTensor-aware optimizer.step (FSDP2 per-parameter all-gather /
+      reduce-scatter is hidden inside the sharded parameters).
+
+    Branches:
+
+    - TP size > 1 applies column/row-parallel DTensor plans to attention + MLP;
+      = 1 falls back to pure FSDP2 data parallel.
+    - PP size > 1 activates the pipeline schedule in forward_backward_batch; = 1 runs
+      a flat fwd+bwd loop.
+    - Context Parallel (CP) and Ulysses SP shard along the sequence dim when enabled;
+      they are complementary — CP is native DTensor, Ulysses SP is verl's variant.
+    - forward_only (compute_log_prob / reward) skips backward + optimizer.step;
+      train path (update_policy / update_critic) runs full fwd+bwd+step.
+    - LM-head specialization is in TorchTitanEngineWithLMHead.
+
+    Why:
+
+    - Chosen when strategy="torchtitan" — newer, DTensor-native, and cleaner than
+      Megatron but less battle-tested at 400B+ scale.
+    - FSDP2 (per-parameter sharding with DTensor) replaces FSDP1's flat-param design,
+      giving finer-grained memory and composable TP/PP/CP meshes.
+    - Context Parallel extends sequence length beyond what TP alone can handle and is
+      complementary to Ulysses SP for very long contexts (TorchTitan, Liang 2024).
+    - Picked over Megatron when the team wants a PyTorch-native stack with a simpler
+      mental model, accepting the maturity trade-off.
     """
 
     def __init__(

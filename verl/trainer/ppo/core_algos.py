@@ -150,6 +150,21 @@ def get_adv_estimator_fn(name_or_enum):
     return ADV_ESTIMATOR_REGISTRY[name]
 
 
+# What: stateful KL coefficient controller; update(current_kl, n_steps) multiplies
+#       self.value (beta) by 1 + clip(current_kl/target - 1, +-0.2) * n_steps/horizon.
+# Lifecycle: driver-process singleton, instantiated once in RayPPOTrainer.__init__
+#       via get_kl_controller(); update() ticks once per global step after KL is
+#       measured, mutating self.value in place (no tensor state, pure Python scalars).
+# Called by: apply_kl_penalty() in verl/trainer/ppo/ray_trainer.py — reads beta
+#       via kl_ctrl.value to scale the per-token KL penalty subtracted from
+#       token_level_scores, then calls kl_ctrl.update(current_kl, batch_size).
+# Branches:
+#   - current_kl >> target: proportional_error saturates at +0.2, beta grows
+#   - current_kl << target: proportional_error saturates at -0.2, beta shrinks
+#   - FixedKLController alternative (same .value interface, update() is a no-op)
+# Why: InstructGPT §3.2 proportional controller on KL(pi || pi_ref) keeps the policy
+#       near SFT init; clipping at +-0.2 caps a single noisy KL estimate from blowing
+#       up beta, horizon sets the time constant for beta to track the target.
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:
@@ -212,6 +227,22 @@ def get_kl_controller(kl_ctrl):
         raise NotImplementedError
 
 
+# What: inputs token_level_rewards/values/response_mask all (B, T) plus scalars
+#       gamma, lam; backward scans t = T-1..0 accumulating lastgaelam = delta
+#       + gamma*lam*lastgaelam; returns advantages (B, T) whitened over the mask
+#       and returns = advantages + values (B, T) for the critic target.
+# Lifecycle: driver-CPU (under torch.no_grad); invoked once per training step
+#       inside compute_advantage() after reward aggregation, before the batch is
+#       dispatched to actor/critic workers. Small tensors, no GPU sync required.
+# Called by: compute_advantage() in verl/trainer/ppo/ray_trainer.py on the
+#       AdvantageEstimator.GAE branch; also registered in ADV_ESTIMATOR_REGISTRY.
+# Branches:
+#   - response_mask[t] == 1: propagate nextvalues/lastgaelam normally
+#   - response_mask[t] == 0 (padding past EOS): freeze both carries so TD error
+#       does not leak across the EOS boundary on right-padded sequences
+# Why: InstructGPT §3.1 / Schulman HDCC token-level GAE with lambda; mask-aware
+#       backward scan avoids padding leakage, masked_whiten centers advantages
+#       over real tokens only so variance reduction matches PPO assumptions.
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
@@ -264,6 +295,26 @@ def compute_gae_advantage_return(
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+# What: inputs token_level_rewards (B, T) + response_mask (B, T) + index (B,) uid
+#       array (rollout.n copies share a uid); sums rewards to scalar (B,), groups
+#       by uid, computes per-group mean/std, normalizes, then broadcasts the
+#       scalar advantage along T masked by response_mask. Returns (adv, adv) — no
+#       separate returns tensor because there is no critic bootstrap.
+# Lifecycle: driver-CPU under torch.no_grad; called once per training step from
+#       compute_advantage() after reward aggregation, before dispatch to workers.
+#       Uses a Python defaultdict loop over the batch (O(B)); see
+#       compute_grpo_vectorized_outcome_advantage for the tensorized variant.
+# Called by: compute_advantage() in verl/trainer/ppo/ray_trainer.py (GRPO branch);
+#       also reused inside compute_gdpo_outcome_advantage() per reward dimension.
+# Branches:
+#   - group size == 1: mean=0, std=1 fallback so a degenerate group yields zero
+#       advantage instead of NaN (can happen with rollout.n=1 debug runs)
+#   - norm_adv_by_std_in_grpo=True: full GRPO, divide by std + epsilon
+#   - norm_adv_by_std_in_grpo=False: Dr.GRPO variant (arXiv 2503.20783), subtract
+#       mean only to avoid length/difficulty bias from std scaling
+# Why: DeepSeekMath §3 GRPO replaces the learned value baseline with a group
+#       mean/std over same-prompt rollouts — drops the critic, saving ~1.3-1.5x
+#       compute and one model's worth of GPU memory vs PPO.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,

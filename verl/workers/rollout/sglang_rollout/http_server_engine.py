@@ -568,18 +568,54 @@ class HttpServerAdapter(EngineBase):
 
 
 class AsyncHttpServerAdapter(HttpServerAdapter):
-    """Asynchronous HTTP-based adapter for SGLang engines.
+    """Async HTTP client wrapper over an out-of-process SGLang server (EngineBase).
 
-    This class inherits from HttpServerAdapter and adds async capabilities
-    for non-blocking HTTP requests to the SGLang server. It provides the same
-    functionality as the synchronous version but with async/await support.
+    What:
+      - Subclass of HttpServerAdapter that swaps blocking `requests` calls for
+        aiohttp-based non-blocking ones, while reusing the parent's server-process
+        launch / router registration / shutdown logic.
+      - Exposes the SGLang REST surface (/generate, /classify, /flush_cache,
+        /release_memory_occupation, /resume_memory_occupation, /update_weights_from_tensor,
+        /load_lora_adapter_from_tensors, /abort_request, /v1/models) with async
+        methods so one asyncio event loop can drive many concurrent rollouts.
 
-    The async adapter is useful when you need to make multiple concurrent requests
-    or integrate with async frameworks. It uses aiohttp for efficient async HTTP
-    communication and maintains connection pooling for better performance.
+    Why:
+      - AgentLoop / async rollout / off-policy training paths must drive generation
+        from an external Python process (the AgentLoop worker), not from inside
+        the SGLang engine process. HTTP is the clean IPC boundary; aiohttp lets a
+        single AgentLoop worker pipeline hundreds of in-flight rollouts into
+        SGLang's continuous-batch scheduler (ORCA §3 iteration-level scheduling).
+      - Compared to in-process Engine calls used by the sync path, the HTTP path
+        also decouples rollout lifecycle (sleep/wake/update_weights) from the
+        driver process, which is required for standalone-server deployments.
+
+    Lifecycle:
+      - Instantiated by sglang_rollout.py inside the SGLang rollout worker (see
+        `self._engine = AsyncHttpServerAdapter(...)`), which in turn is brought
+        up by SGLangReplica.launch_servers() per node.
+      - __init__ -> super().__init__ -> launch_server_process() starts the SGLang
+        HTTP server subprocess on node_rank==0 and health-checks it.
+      - Request-time: _get_session() builds a fresh aiohttp session with a pooled
+        TCPConnector for every _make_async_request call (intentionally — avoids
+        cross-task session contention at the cost of a connector rebuild).
+      - Tear-down via inherited shutdown() -> kill_process_tree on the server PID.
+
+    Called by:
+      - verl/workers/rollout/sglang_rollout/sglang_rollout.py (self._engine).
+      - AgentLoop workers route sticky-by-request-id to preserve radix prefix
+        cache locality across multi-turn steps (SGLang paper's radix cache).
+
+    Branches:
+      - only_master=True + node_rank!=0 -> short-circuit to {} (all control-plane
+        ops go through rank-0 TokenizerManager; peers no-op).
+      - method GET vs POST inside _make_async_request.
+      - update_weights / sleep / wake each hit a distinct endpoint that maps to
+        SGLang's TokenizerManager handlers; semantics match the in-process
+        tokenizer_manager calls used by SGLangHttpServer.
 
     Attributes:
-        max_connections (int): Maximum number of connections in the connection pool
+        max_connections (int): aiohttp TCPConnector pool cap; limit_per_host is
+            max_connections // 4 to avoid one host starving others.
     """
 
     def __init__(
@@ -716,29 +752,34 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         raise RuntimeError(f"Failed to complete async request to {endpoint} after {self.max_attempts} attempts")
 
     async def release_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
-        """Release GPU memory occupation temporarily (async version).
+        """Sleep path: tell SGLang to free the tagged GPU memory regions.
 
-        Args:
-            tags (Optional[List[str]], optional): List of tags to specify which memory to release.
-                If None, releases all memory. Defaults to None. ["weights", "kv_cache"]
+        What:
+          - tags controls granularity: ["kv_cache"] only, or ["kv_cache","weights"].
+          - In HYBRID colocation, this is how the rollout engine yields GPU memory
+            back to the FSDP actor for the train-step (HybridFlow 3D-HybridEngine
+            time-shares GPU between rollout and train on the same devices).
 
-        Returns:
-            Dict[str, Any]: Server response indicating memory release status
+        Called by:
+          - SGLangHttpServer.sleep() and the higher-level RolloutReplica.sleep()
+            flow between PPO iterations.
         """
         return await self._make_async_request("release_memory_occupation", {"tags": tags})
 
     async def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
-        """Resume GPU memory occupation (async version).
+        """Wake path: re-materialize KV cache and/or weights on GPU before rollout.
 
-        Similar to AsyncEngine, this method handles first-time weight reloading
-        by calling release_memory_occupation if needed.
+        What:
+          - Inverse of release_memory_occupation: asks the SGLang server to
+            re-allocate the tagged regions (typically right before generate()).
 
-        Args:
-            tags (Optional[List[str]], optional): List of tags to specify which memory to resume.
-                If None, resumes all memory. Defaults to None. ["weights", "kv_cache"]
+        Called by:
+          - SGLangHttpServer.wake_up() after train-step completes and control
+            returns to the rollout engine.
 
-        Returns:
-            Dict[str, Any]: Server response indicating memory resume status
+        Branches:
+          - LoRA-as-adapter mode keeps base weights resident, so only kv_cache
+            is resumed (see SGLangHttpServer.sleep() asymmetric tags).
         """
         return await self._make_async_request("resume_memory_occupation", {"tags": tags})
 
@@ -746,17 +787,24 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         self,
         req: UpdateWeightsFromTensorReqInput,
     ) -> dict[str, Any]:
-        """Update model weights from tensor data asynchronously.
+        """Push newly trained FSDP/DTensor weights into the running SGLang engine.
 
-        Args:
-            serialized_named_tensors (List[str]): List of serialized tensor data
-            load_format (Optional[str], optional): Format specification for loading weights.
-                Defaults to None.
-            flush_cache (bool, optional): Whether to flush cache after updating weights.
-                Defaults to True.
+        What:
+          - Base64-encodes the serialized named-tensor metadata (NOT the raw
+            weights — real weight buffers are transferred GPU->GPU by SGLang
+            internally, this HTTP call only carries the handles/load_format
+            directive) and POSTs to /update_weights_from_tensor.
 
-        Returns:
-            Dict[str, Any]: Server response containing update status
+        Called by:
+          - RLHF weight-sync path after the actor FSDP step: trainer calls into
+            sglang_rollout which delegates here. In HYBRID colocation, this is
+            the hot-path that swaps fresh policy weights into the rollout engine
+            between PPO iterations (HybridFlow 3D-HybridEngine).
+
+        Why async:
+          - PPO weight sync can run concurrently with flush_cache and other
+            control-plane ops; making it awaitable avoids blocking the AgentLoop
+            event loop while SGLang rebuilds its CUDA graphs / redoes paging.
         """
         import base64
 
@@ -841,7 +889,27 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         lora_path: Optional[str] = None,
         custom_logit_processor: Optional[Callable] = None,
     ) -> dict[str, Any]:
-        """Generate text using the SGLang server asynchronously."""
+        """Submit one generation request over HTTP to the SGLang server.
+
+        What:
+          - Non-None fields are packed into the /generate payload (text-in or
+            token-ids-in) and awaited via _make_async_request. only_master=False
+            because generation traffic must reach all rank-0 HTTP endpoints when
+            multiple replicas are load-balanced.
+
+        Called by:
+          - AgentLoop workers / async rollout driver. GlobalRequestLoadBalancer
+            routes sticky-by-request-id across replicas so multi-turn continuations
+            keep landing on the replica that holds the radix prefix cache entry
+            (SGLang paper §Radix Cache).
+
+        Why one-shot vs streaming:
+          - veRL's rollout consumes the final sequence + logprobs only, so it
+            uses the blocking /generate form instead of SGLang's SSE streaming.
+          - SGLang's internal scheduler still uses ORCA-style iteration-level
+            batching under the hood; this endpoint just blocks the caller until
+            the scheduler finalizes the request.
+        """
         logger.info("generate() started")
 
         payload = {

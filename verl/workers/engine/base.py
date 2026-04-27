@@ -28,10 +28,46 @@ from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 class BaseEngine:
     """
-    Abstract base class defining the interface for model training engines. Interface is subject to
-    change before release.
+    Abstract base class defining the training-engine contract for verl workers.
 
-    Engine implementations must subclass BaseEngine and provide concrete behavior for all methods.
+    What:
+      The backend-agnostic interface that every concrete training engine
+      (FSDPEngine, MegatronEngine, TorchTitanEngine, MindSpeedEngine, VeOmniEngine)
+      must implement. Hides sharding / parallelism strategy from the role layer
+      (actor / critic / reference / reward), so DataParallelPPOActor and
+      DataParallelPPOCritic can swap backends via config without code changes.
+
+    Lifecycle / contract expectation:
+      - initialize() builds module, optimizer, LR scheduler.
+      - train_mode() / eval_mode() return context managers that switch dropout,
+        grad tracking, and auto-offload model/optimizer to/from GPU on entry/exit.
+      - Every concrete engine implements forward_backward_batch, which must
+        return per-step loss + stats (and, when not forward_only, has already
+        accumulated gradients). train_batch wraps it with zero_grad +
+        optimizer_step; infer_batch wraps it with torch.no_grad.
+      - optimizer_step returns grad_norm (pre-clip) so callers can log it.
+
+    Called by:
+      - verl/workers/roles/actor/dp_actor.py::DataParallelPPOActor.update_policy
+      - verl/workers/roles/critic/dp_critic.py::DataParallelPPOCritic.update_critic
+      - reference / reward role wrappers via infer_batch
+
+    Call graph (THIS ENTITY):
+      role.update_policy -> engine.train_batch -> engine.optimizer_zero_grad
+                                               -> engine.forward_backward_batch
+                                               -> engine.optimizer_step
+                                               -> engine.lr_scheduler_step
+
+    Branches:
+      - train_batch vs infer_batch: presence/absence of backward + optimizer step.
+      - is_mp_src_rank_with_outputs gates which rank attaches grad_norm to outputs
+        (only the rank that holds materialized logits in MP groups).
+
+    Why:
+      Mirrors the HybridFlow (verl paper, §4 3D-HybridEngine) layering: workloads
+      bind to an abstract Engine, then config picks FSDP vs Megatron vs TorchTitan
+      at instantiation time. Keeps PPO/GRPO loss code free of sharding concerns
+      and lets rollout/training memory layouts be swapped independently.
     """
 
     def initialize(self):

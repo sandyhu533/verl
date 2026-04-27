@@ -82,6 +82,46 @@ class vLLMHttpServer:
     ```
     vllm serve --tensor-parallel-size=8 ...
     ```
+
+    What:
+      - Per-node FastAPI+uvicorn front-end wrapping an `AsyncLLM` engine (vLLM V1 async engine).
+      - Hosts an OpenAI-compatible HTTP API and a token-in/token-out `generate()` coroutine
+        used directly by in-process callers (AgentLoop, ServerAdapter) via Ray actor calls.
+      - Backend engine is PagedAttention (SOSP'23) with continuous batching; the inner
+        `generate()` async-for loop is the ORCA §3 iteration-level scheduling lineage.
+
+    Lifecycle:
+      - Constructed as a Ray actor by `vLLMReplica.launch_servers` (one per node in a replica).
+      - `launch_server()` synthesizes `vllm serve` CLI args, calls `run_server` (node_rank==0)
+        or `run_headless` (other nodes); node-0 builds the FastAPI app via `build_app` /
+        `init_app_state` and starts uvicorn through `run_uvicorn`.
+      - `sleep`/`wake_up` toggle GPU memory release for HYBRID/COLOCATED co-location
+        (HybridFlow §4 3D-HybridEngine).
+
+    Called by:
+      - `vLLMReplica` (Ray actor handle wrapping this class).
+      - `ServerAdapter` / `AgentLoop` clients via HTTP or direct `ray.remote` method calls.
+
+    Call graph:
+      - `launch_server` -> `run_server` -> `AsyncLLM.from_vllm_config` -> `build_app` +
+        `init_app_state` -> `run_uvicorn`.
+      - `generate` -> `AsyncLLM.generate` -> `async for RequestOutput` -> `TokenOutput`.
+
+    Branches:
+      - node_rank == 0 hosts uvicorn + engine; other nodes run `run_headless` (DP worker role).
+      - HYBRID vs COLOCATED vs STANDALONE rollout mode changes sleep/wake semantics
+        and whether `load_format=dummy` is forced to `auto`.
+      - LoRA-as-adapter path attaches a `LoRARequest` per generate; otherwise merged weights.
+      - vLLM >= 0.12.0 uses `pause_generation`/`resume_generation`; older branches
+        fall back to manual per-request abort.
+
+    Why:
+      - HTTP endpoint is kept even when HYBRID-mode callers are in-process, because
+        AgentLoop and async/off-policy pipelines call rollout from external processes
+        (multi-turn tool use, detached rollout cluster). One unified FastAPI surface
+        avoids forking the OpenAI-compatible API code path.
+      - Node-0-only master address + free-port reservation gives DP child nodes a stable
+        rendezvous for `torch.distributed.init_process_group` and vLLM's DP RPC.
     """
 
     def __init__(
@@ -192,6 +232,32 @@ class vLLMHttpServer:
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        """Synthesize a `vllm serve ...` CLI invocation and boot the engine + FastAPI app.
+
+        What:
+          - Builds the args dict that would equivalently be passed on the `vllm serve` CLI,
+            then feeds it through vLLM's own `FlexibleArgumentParser` so engine semantics
+            match the upstream server exactly.
+          - Sets `worker_extension_cls` to verl's `vLLMColocateWorkerExtension` so each
+            TP worker exposes bucketed-IPC weight-sync RPCs used by FSDP/Megatron trainer.
+
+        Lifecycle:
+          - Called once per node by `vLLMReplica.launch_servers` after node-0 publishes
+            master_address/master_port/dp_rpc_port.
+          - Terminal in-actor; `run_server` owns the uvicorn task for the lifetime of
+            the replica.
+
+        Branches:
+          - `data_parallel_size > 1`: injects DP CLI args so vLLM launches DP workers
+            and wires their RPC rendezvous through the reserved free port.
+          - `nnodes > 1`: passes master_addr/node_rank for torch.distributed.
+          - LoRA: enables vLLM LoRA slot (max_loras=1) for adapter hot-swap.
+          - node_rank == 0 -> `run_server` (engine + HTTP); else -> `run_headless`.
+
+        Why:
+          - Reusing the vLLM CLI parser keeps us compatible with every `vllm serve`
+            feature flag without re-implementing validation.
+        """
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -373,6 +439,24 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        """Boot the AsyncLLM engine and mount it behind uvicorn on node_rank==0.
+
+        What:
+          - Instantiates `AsyncLLM` (vLLM V1 async engine) from the parsed CLI args.
+          - Monkey-patches the model (`monkey_patch_model` collective RPC) so the
+            embedding/lm_head vocab matches the external tokenizer — required because
+            trainer tokenizers may have extra tokens appended.
+          - Calls upstream `build_app` + `init_app_state` so the OpenAI-compatible
+            routes (/v1/chat/completions, /v1/completions, ...) stay in lock-step
+            with vLLM releases via inspect-based signature shims.
+
+        Lifecycle:
+          - Runs once; retains `self.engine` and a uvicorn task until actor death.
+
+        Why:
+          - Keeping AsyncLLM in-process (same actor as the HTTP app) avoids an extra
+            IPC hop for each generate(), which matters for high-QPS agent loops.
+        """
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -446,7 +530,43 @@ class vLLMHttpServer:
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
-        """Generate sequence with token-in-token-out."""
+        """Generate sequence with token-in-token-out.
+
+        What:
+          - Inner prompt->tokens path: normalize ids, bound `max_tokens` against the
+            remaining context window, build `SamplingParams` + `TokensPrompt`, kick
+            off `engine.generate(...)` and drain the async iterator for the final
+            `RequestOutput`, then repackage into verl's `TokenOutput`.
+
+        Lifecycle:
+          - One coroutine per generate call; awaits continuously while vLLM's engine
+            step loop schedules this request alongside others (iteration-level
+            scheduling, ORCA §3, inherited via vLLM continuous batching).
+
+        Called by:
+          - ServerAdapter / AgentLoop clients through Ray actor RPC or HTTP.
+
+        Call graph:
+          - `engine.generate` -> vLLM V1 scheduler -> PagedAttention KV blocks ->
+            `RequestOutput` stream -> terminal snapshot -> `TokenOutput`.
+
+        Branches:
+          - `max_tokens` resolved from explicit arg, sglang-style `max_new_tokens`,
+            or derived from `response_length` / remaining prompt budget (multi-turn
+            safety cap to avoid OOM on long trajectories).
+          - LoRA adapter attached only if already loaded in the engine (avoids a
+            race with concurrent adapter reload).
+          - `finish_reason == "abort"` maps to `stop_reason="aborted"` for
+            downstream trainer bookkeeping (rejection sampling / preemption stats).
+
+        Why:
+          - Token-in/token-out avoids re-tokenizing across agent turns, and lets
+            AgentLoop pass already-templated chat histories without round-tripping
+            through the OpenAI JSON schema.
+          - `async for` draining (instead of `await engine.generate`) is how vLLM V1
+            surfaces per-step deltas; verl only needs the terminal output, but the
+            iteration still cooperatively yields to the scheduler event loop.
+        """
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -553,6 +673,19 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self):
+        """Re-materialize KV cache + weights on GPU after a sleep cycle.
+
+        Branches:
+          - HYBRID: wake is fused into `update_weights` (trainer drives it via
+            bucketed IPC); calling this directly is an error.
+          - COLOCATED: restore both kv_cache and weight tags, then reset prefix
+            cache so stale entries from the previous step don't leak.
+          - STANDALONE: no-op; engine never slept.
+
+        Why:
+          - HybridFlow §4 3D-HybridEngine keeps trainer and rollout on the same
+            GPUs; sleep/wake is how we time-multiplex VRAM between the two roles.
+        """
         if self.node_rank != 0:
             return
 
@@ -567,6 +700,21 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        """Release GPU memory so the trainer can reclaim VRAM for optimizer states.
+
+        Branches:
+          - HYBRID: `_sleep_hybrid` picks level=1 (lora adapters only) or level=2
+            (full weights) — level=2 frees weights AND kv cache buffers.
+          - COLOCATED: engine.sleep(level=1) frees only kv cache; weights stay
+            resident because the trainer and rollout share the same process group
+            but not the same weight tensors.
+          - STANDALONE: no-op; rollout cluster is independent from trainer.
+
+        Why:
+          - Matches HybridFlow's time-multiplexed VRAM pattern: trainer step needs
+            optimizer states + gradients; rollout step needs kv cache + attention
+            scratch. Sleep hands ownership back.
+        """
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
@@ -867,6 +1015,53 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    """Ray-level orchestrator for one vLLM rollout replica (possibly multi-node).
+
+    What:
+      - Concrete `RolloutReplica` subclass that turns a set of FSDP/Megatron worker
+        actors (owning the GPUs) into a running vLLM server.
+      - Spawns one `vLLMHttpServer` Ray actor per node, with node-affinity scheduling
+        so the actor lands on the exact host that holds the target GPUs.
+      - Exposes replica-level aggregation APIs (sleep, abort_all_requests, abort_request,
+        resume_generation) that fan out across nodes in the replica.
+
+    Lifecycle:
+      - Constructed by the PPO ray trainer (`ray_trainer.init_workers`) per rollout
+        replica (replica_rank ∈ [0, n_replicas)).
+      - `launch_servers` is called once after workers are ready: it queries each
+        worker for (node_id, CUDA_VISIBLE_DEVICES), then creates server actors with
+        `NodeAffinitySchedulingStrategy(soft=False)` to co-locate with the GPUs.
+      - Node-0 exports master_address/master_port/dp_rpc_port; other nodes receive
+        these via RPC and join the distributed group inside `launch_server`.
+
+    Called by:
+      - `verl.trainer.ppo.ray_trainer.RayPPOTrainer` and async/agent-loop equivalents,
+        through the generic `RolloutReplica` interface.
+
+    Call graph:
+      - `launch_servers` -> N * `vLLMHttpServer.__init__` (Ray remote) ->
+        `vLLMHttpServer.launch_server` (parallel) -> `run_server` / `run_headless`.
+      - `sleep` / `abort_*` -> fan-out to every server actor via `asyncio.gather`.
+
+    Branches:
+      - `is_reward_model` / `is_teacher_model` / user-supplied name_suffix affects
+        the Ray actor naming convention (kept distinct so multiple vLLM replicas can
+        coexist in one cluster without name collisions).
+      - RolloutMode (HYBRID / COLOCATED / STANDALONE) flows through to each server
+        and changes weight-sync + sleep/wake semantics.
+      - Multi-node MP executor path requires vLLM >= 0.11.1 (guarded by
+        `_validate_launch_requirements`).
+
+    Why:
+      - One actor per node (instead of one global actor) keeps NCCL/DP RPC traffic
+        on intra-node fabric when possible and avoids one actor becoming a bottleneck
+        for hundreds of inflight requests in AgentLoop.
+      - Node affinity with soft=False is essential: vLLM's TP workers assume the
+        server is on the same host as the GPU processes it talks to.
+      - `NCCL_CUMEM_ENABLE=0` is set via runtime_env to avoid the known vLLM
+        disaggregated weight-sync hang (see upstream issue + troubleshooting doc).
+    """
+
     def __init__(
         self,
         replica_rank: int,
@@ -883,7 +1078,28 @@ class vLLMReplica(RolloutReplica):
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
-        """Launch http server in each node."""
+        """Launch http server in each node.
+
+        What:
+          - For each node in the replica: resolves the node_id and CUDA_VISIBLE_DEVICES
+            of its worker shard, then creates a `vLLMHttpServer` Ray actor pinned to
+            that node with exactly those GPUs visible.
+          - Node-0 server is instantiated first and queried for master/DP-RPC ports;
+            those values are propagated to the other servers' `launch_server` calls so
+            all nodes join one torch.distributed + vLLM DP rendezvous.
+
+        Call graph:
+          - worker.__ray_call__ (collect node_id + accelerator ids) -> server actor
+            creation -> gather(launch_server) -> get_server_address (node-0).
+
+        Why:
+          - `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` tells Ray not to rewrite
+            CUDA_VISIBLE_DEVICES so vLLM sees the exact GPU ordering the trainer
+            workers already claimed; otherwise TP rank<->GPU mapping can desync.
+          - Creating all servers first, then launching in parallel, avoids head-of-line
+            blocking where node-0's multi-minute engine init would delay other nodes
+            from starting their headless workers.
+        """
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )

@@ -183,7 +183,74 @@ class WorkerGroup:
         return len(self._workers)
 
     def _bind_worker_method(self, user_defined_cls, func_generator):
-        """Binds worker methods to the WorkerGroup based on registered attributes.
+        """What:
+          - Walks dir(user_defined_cls) looking for methods decorated with @register
+            (identified by the MAGIC_ATTR marker the decorator attaches).
+          - For each marked method: resolves the dispatch_fn / collect_fn / execute_fn trio
+            from MAGIC_ATTR, wraps them into a closure via func_generator, and setattrs the
+            closure onto self so wg.method_name(...) routes dispatch -> execute -> collect.
+          - Returns the list of method names successfully bound (used by callers to skip
+            non-registered helpers).
+
+        Lifecycle:
+          - Runs on the driver, once per WorkerGroup, at the tail end of
+            RayWorkerGroup.__init__ after all Ray actors have been spawned and confirmed
+            alive. Before this call, wg.generate_sequences(batch) raises AttributeError;
+            after this call it works.
+          - Re-invoked by RayWorkerGroup.spawn_fused / fuse to rebind methods of a fused
+            sub-class onto a freshly constructed sub-WorkerGroup (FusedWorker flow).
+
+        Called by:
+          - RayWorkerGroup.__init__          (verl/single_controller/ray/base.py ~L622)
+          - RayWorkerGroup.spawn_fused       (verl/single_controller/ray/base.py ~L907)
+          - RayWorkerGroup.fuse              (verl/single_controller/ray/base.py ~L932)
+
+        Call graph:
+          run_qwen2-7b.sh                                  [layer: launch shell]
+            -> verl/trainer/main_ppo.py::main              [layer: entry]
+              -> TaskRunner.run  (ray remote)              [layer: driver actor]
+                -> RayPPOTrainer.init_workers              [layer: trainer]
+                  -> RayWorkerGroup.__init__
+                     -> _init_with_resource_pool           [layer: ray rpc]
+                        -> (Ray spawns N actors; Worker.__init__ runs in each)
+                     -> WORKERGROUP._BIND_WORKER_METHOD    <-- THIS ENTITY [layer: dispatch]
+                        -> get_predefined_dispatch_fn      (scatter/gather strategy)
+                        -> get_predefined_execute_fn       (execute_all / execute_rank_zero)
+                        -> func_generator(...)             (returns Functor closure)
+                        -> setattr(self, method_name, Functor)
+                           -> later: wg.generate_sequences(batch)  [layer: trainer]
+                              -> dispatch_fn -> execute_fn -> ray.remote call
+                                 -> UserWorker.generate_sequences  [layer: workers]
+
+        Branches:
+          - getattr(user_defined_cls, method_name) raises -> caught, method skipped (class
+            properties resolved off the type can't be introspected without an instance).
+          - method lacks MAGIC_ATTR -> plain Python helper, not bound (stays local,
+            non-remote).
+          - dispatch_mode is a Dispatch enum -> resolve via get_predefined_dispatch_fn
+            (built-in scatter/gather strategies: ONE_TO_ALL, ALL_TO_ALL, DP_COMPUTE_PROTO,
+            DP_COMPUTE_PROTO_WITH_FUNC, MEGATRON_COMPUTE_PROTO...).
+          - dispatch_mode is a dict -> caller-supplied dispatch_fn / collect_fn used
+            directly; escape hatch for custom sharding not covered by the enum.
+          - execute_mode resolves to execute_rank_zero -> only rank 0's return value is
+            collected; used for checkpoint save / logging-style side effects.
+          - setattr raises (e.g. attribute already set on self) -> re-raised as ValueError
+            with method_name; fails loudly rather than silently shadowing a prior binding.
+
+        Why:
+          - HybridFlow §3's single-controller-multi-worker binding seam. Without this step
+            the trainer would have to call execute_all("generate_sequences", batch) and
+            pass method names as strings for every remote op, losing IDE support and
+            type-checking.
+          - Binding is per-WorkerGroup (not per-class) so the same user class can be used
+            for an actor group, a rollout group, and a fused group simultaneously, each
+            with its own resource pool and its own bound closures pointing at their own
+            Ray actor handles.
+          - Returning method_names (rather than just mutating self) lets callers detect
+            collisions across fused sub-classes: the FusedWorker flow uses this list to
+            decide whether to prefix method names with the sub-class key to disambiguate.
+
+        Binds worker methods to the WorkerGroup based on registered attributes.
 
         Args:
             user_defined_cls (type): The class containing methods to bind

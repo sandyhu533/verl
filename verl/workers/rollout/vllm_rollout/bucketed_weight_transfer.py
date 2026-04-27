@@ -72,16 +72,69 @@ def rebuild_shared_memory(name: str, size: int, dtype=torch.uint8):
 
 
 class BucketedWeightSender:
-    """
-    Send model weights via bucketed IPC transfer over ZMQ.
+    """Streams sharded model weights into the colocated rollout engine in fixed-size buckets.
 
-    Packs weight tensors into a fixed-size communication buffer and sends them
-    in buckets to the receiver. Supports CUDA IPC and shared memory fallback.
+    What:
+      - Packs training-side parameter tensors into one fixed-size uint8
+        "bucket" buffer and ships them to a `BucketedWeightReceiver`
+        running inside the vLLM worker process on the same node.
+      - The bucket is transported by CUDA IPC handle (default) or by
+        POSIX shared memory (`use_shm=True`, e.g. NPU / non-CUDA devices).
+        ZMQ is used only as a tiny REQ/REP control channel that passes the
+        IPC/shm handle once and then signals "bucket ready" per round.
+
+    Lifecycle:
+      - __init__: record config, lazily allocate socket / buffer.
+      - async_send_weights(): init socket -> send buffer handle -> loop
+        (fill bucket | flush once full) -> flush last bucket -> cleanup.
+      - _cleanup(): close socket, drop buffer, unlink shm, force
+        `ipc_collect` + `empty_cache` so the engine side can reclaim VRAM
+        before generation resumes.
+
+    Called by:
+      - verl.workers.rollout.vllm_rollout.vllm_rollout -- the HybridEngine
+        sharding manager instantiates one sender per rollout worker when
+        resharding trained weights back into the vLLM engine after each
+        PPO/GRPO update step.
+
+    Call graph:
+      - async_send_weights() -> ensure_async_iterator(weights) ->
+        device.synchronize() + socket.send_pyobj({bucket_meta, is_last})
+        -> receiver rebuilds tensors from the same IPC buffer and calls
+        `on_bucket_received` (typically `model.load_weights`).
+
+    Branches:
+      - Bucket overflow (`offset + nbytes > bucket_size`): synchronize,
+        flush the current bucket, wait for ACK, then start a fresh one.
+        Final `is_last=True` message drains the tail bucket.
+      - CUDA IPC vs shared memory: IPC is zero-copy on-GPU; shm path
+        materializes on CPU and the receiver does a `.to(device)` copy.
+      - One weight exceeding `bucket_size` hard-asserts -- there is no
+        per-tensor chunking yet (embedding layer is the likely culprit;
+        see the TODO in the loop).
+
+    Why:
+      - Canonical reference: HybridFlow / 3D-HybridEngine (section 4 of
+        the veRL paper) -- "amortized weight reshard IPC". Sending one
+        tensor per message would be dominated by Python pickling and ZMQ
+        syscall overhead (thousands of params); a single mega-buffer
+        would spike peak memory on both sides and starve overlap between
+        copy-in and copy-out. Bucketing amortizes serialization while
+        bounding extra VRAM to `bucket_size_mb`.
+      - Interview-ready knob: `bucket_size_mb` is the throughput / memory
+        trade-off -- too small wastes syscalls and hurts copy-engine
+        overlap; too large inflates peak device memory and delays the
+        first bucket (latency to first token after a step).
+      - ZMQ here is deliberately NOT the data plane; it is only a
+        rendezvous for the handle and a per-bucket barrier. The real
+        transport is the OS shared page (CUDA IPC or POSIX shm), which
+        is why this file sits next to the HybridEngine sharding manager
+        rather than in a generic networking layer.
 
     Args:
-        zmq_handle: ZMQ IPC socket path (e.g., "ipc:///tmp/rl-colocate-zmq-<uuid>.sock")
-        bucket_size_mb: Communication buffer size in MB
-        use_shm: Use shared memory instead of CUDA IPC (for NPU compatibility)
+        zmq_handle: ZMQ IPC socket path (e.g., "ipc:///tmp/rl-colocate-zmq-<uuid>.sock").
+        bucket_size_mb: Communication buffer size in MB (throughput knob).
+        use_shm: Use POSIX shared memory instead of CUDA IPC (NPU-compatible path).
     """
 
     def __init__(
@@ -101,11 +154,46 @@ class BucketedWeightSender:
         self.shm = None
 
     async def async_send_weights(self, weights):
-        """
-        Send weights to the receiver. Accepts a sync generator or async iterator.
+        """Pack and stream (name, tensor) pairs across bucket boundaries.
+
+        What:
+          - Drains a (possibly async) iterator of trained weights, copies
+            each tensor's raw bytes into `self.buffer` at the current
+            offset, and accumulates a `bucket_meta` dict describing its
+            layout (shape, dtype, offset) for the receiver.
+
+        Lifecycle:
+          - _init_socket() + _init_buffer() run once (handshake passes
+            the IPC/shm handle), then a fill-or-flush loop, then a final
+            flush with `is_last=True`, then `_cleanup()` in `finally`.
+
+        Called by:
+          - `vllm_rollout.update_weights` / the HybridEngine sharding
+            manager after the training step has reshaped / gathered
+            FSDP or TP shards into generator form.
+
+        Branches:
+          - Overflow path: device.synchronize() before send to make sure
+            all async H2D/D2D copies into the buffer have landed, then
+            REQ-send the metadata and block on receiver ACK before
+            reusing the buffer for the next bucket.
+          - Non-overflow path: pure memcpy into the buffer; zero ZMQ
+            traffic until the bucket fills up.
+
+        Why:
+          - The commented-out `weight.to(dtype, non_blocking=True)` is a
+            deliberate decision (see vermouth1992 note): some layers
+            (e.g. MoE gate) must stay fp32 for numerical stability, so
+            casting is pushed to the rollout side on demand -- at the
+            cost of larger per-bucket bytes. This is a trade the
+            sharding manager owns, not the transport.
+          - The REQ/REP handshake around every bucket gives implicit
+            back-pressure: the sender cannot race ahead of the
+            receiver's `load_weights` callback, which would otherwise
+            corrupt the single shared buffer.
 
         Args:
-            weights: Generator or async iterator yielding (name, tensor) pairs
+            weights: Sync generator or async iterator yielding (name, tensor).
         """
         from verl.workers.rollout.utils import ensure_async_iterator
 

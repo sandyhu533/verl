@@ -334,6 +334,59 @@ class TRTLLMHttpServer:
 
 
 class TRTLLMReplica(RolloutReplica):
+    """RolloutReplica specialization for NVIDIA TensorRT-LLM.
+
+    What:
+      - One replica owns one `TRTLLMHttpServer` Ray actor that wraps
+        `tensorrt_llm.AsyncLLM` + `tensorrt_llm.serve.OpenAIServer`.
+      - Compared to vLLM/SGLang, TRT-LLM runs a **compiled engine** (or the
+        "pytorch" backend) with its own C++/CUDA runtime; there is no Python
+        decoder loop to patch, so most customization must go through
+        `ray_worker_extension_cls` injected into TRT-LLM's Ray orchestrator.
+
+    Lifecycle:
+      - __init__ inherits RolloutReplica (resource_pool, world_size,
+        rollout_mode, workers) and records the driver node_ip.
+      - `launch_servers()` computes (pgs, bundle_indices) for this replica's
+        GPU slice, picks the node hosting bundle 0, and spawns the
+        `TRTLLMHttpServer` actor there. The actor then builds `AsyncLLM`
+        asynchronously via `launch_server()`.
+
+    Called by:
+      - verl/workers/rollout/replica.py get_rollout_replica_class() when the
+        rollout engine string is "trtllm".
+      - TRTLLM rollout tests under tests/workers/rollout/rollout_trtllm/.
+
+    Call graph:
+      - launch_servers() -> get_pgs_and_bundle_indices() -> ray.remote(
+        TRTLLMHttpServer) -> server.launch_server.remote() ->
+        AsyncLLM(...) under the hood drives tensorrt_llm Ray workers.
+
+    Branches:
+      - is_teacher_model=True is not supported and raises immediately;
+        unlike vLLMReplica, TRT-LLM has no teacher/Multi-Teacher-OPD path.
+      - `rollout_worker_use_gpu() -> False`: the replica's own training-side
+        workers do not claim GPUs because TRT-LLM's Ray orchestrator
+        (`orchestrator_type="ray"`) claims them directly via placement
+        groups + bundle indices passed into AsyncLLM.
+      - SubRayResourcePool vs plain RayResourcePool: the first gives each
+        replica a pre-sliced subgroup (start_bundle_index known), the
+        second requires walking pgs and computing the offset from
+        replica_rank -- this is the bridge to recent **inter-node** support
+        (commit ee9331f1) where one replica can span multiple PGs.
+
+    Why:
+      - TRT-LLM's engine build is typically offline and the runtime API
+        differs from vLLM (no direct Python scheduler hooks, different
+        sleep/wake semantics, `per_worker_gpu_share` instead of
+        `gpu_memory_utilization`). Wrapping it in a RolloutReplica lets
+        veRL hide those asymmetries behind the same HTTP + ServerAdapter
+        surface that vLLM/SGLang use, so ray_trainer.py does not branch.
+      - The 1:1 replica -> server mapping (see launch_servers) delegates
+        multi-node worker placement to TRT-LLM itself; veRL only picks the
+        host that runs the OpenAI-compatible HTTP front-end.
+    """
+
     def __init__(
         self,
         replica_rank: int,

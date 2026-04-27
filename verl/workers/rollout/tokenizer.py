@@ -24,7 +24,56 @@ __all__ = ["HybridEngineBaseTokenizer"]
 
 
 class HybridEngineBaseTokenizer(ABC):
-    """the tokenizer property and function name should align with HF's to meet vllm requirement"""
+    """Abstract tokenizer surface shared by veRL training code and rollout engines.
+
+    What:
+      - Duck-typed contract that any tokenizer handed to a HybridEngine
+        rollout (vLLM, SGLang, TRT-LLM) must satisfy. Signatures and
+        property names are intentionally aligned with HuggingFace's
+        `PreTrainedTokenizer(Fast)` because vLLM and friends introspect
+        those exact names (`pad_token_id`, `eos_token_id`,
+        `all_special_ids`, `encode`, `decode`, `convert_ids_to_tokens`,
+        `get_added_vocab`, `convert_tokens_to_string`).
+      - Lets veRL wrap non-HF tokenizers (custom BPE, processor-only
+        multimodal paths) and still plug them into HF-shaped call sites
+        without monkey-patching.
+
+    Lifecycle:
+      - Pure abstract -- never instantiated. Concrete subclasses live in
+        model-specific tokenizer shims; most call sites fall back to
+        `transformers.AutoTokenizer` directly, and this ABC is the
+        escape hatch when they cannot.
+      - `is_fast=False` by default: subclasses that back a Rust
+        `tokenizers` instance override it so downstream code can pick
+        the faster batch paths.
+
+    Called by:
+      - Rollout boundary validation: `AsyncRolloutRequest` performs a
+        tokenization sanity check (see `TokenizationSanityCheckModeEnum`
+        in `verl.workers.rollout.schemas`) that re-encodes the assembled
+        prompt via this interface and compares token ids with the
+        ids actually fed to the engine.
+      - `apply_chat_template` consumers in the rollout chat path rely on
+        this being HF-shaped so the same template works across engines.
+
+    Branches:
+      - `is_fast` flips batch-encode vs single-encode code paths on
+        callers.
+      - Properties returning `Optional[int]` (pad/eos) force callers to
+        handle models that genuinely have no pad token.
+
+    Why:
+      - veRL's hybrid engine must agree with the training-side tokenizer
+        byte-for-byte; a mismatch shifts labels by one token and
+        silently corrupts PPO/GRPO advantages. Pinning the interface
+        here -- rather than accepting `Any` -- makes that contract
+        explicit and gives one place to add veRL-specific defaults
+        (e.g. chat-template normalization) across rollout backends.
+      - Keeping names identical to HF (instead of a cleaner veRL-native
+        API) is a deliberate compatibility choice: vLLM's `LLMEngine`
+        and TRT-LLM's OpenAI-compatible server both call these methods
+        by name, so any rename would fork engine code.
+    """
 
     @property
     @abstractmethod

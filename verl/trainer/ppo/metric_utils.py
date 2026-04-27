@@ -86,6 +86,27 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+# What: Reduces per-token DataProto tensors into scalar wandb/mlflow metrics:
+#   sum-over-seq of token_level_scores/token_level_rewards, mask-selected mean/max/
+#   min of advantages and returns, aborted-sample ratio, prompt/response length
+#   stats + clip_ratio (fraction of samples hitting max_response_length).
+# Lifecycle: called once per training step from fit() in ray_trainer.py (and
+#   main_ppo_sync.py) after advantage computation, before the actor/critic update.
+# Called by: RayPPOTrainer.fit() -> metrics.update(compute_data_metrics(...)),
+#   main_ppo_sync AsyncRayPPOTrainer.fit().
+# Branches:
+#   - aborted samples (response_length == 0) are filtered out of score/reward stats
+#     via non_aborted_mask; empty-batch fallbacks log a warning and return NaN.
+#   - advantages / returns use masked_select(response_mask) so only real response
+#     tokens contribute; all-False mask also falls back to NaN.
+#   - use_critic=True -> emits critic/values/{mean,max,min} and critic/
+#     vf_explained_var = 1 - Var(returns-values)/Var(returns); use_critic=False
+#     (GRPO and friends, since there is no learned V) emits an empty dict.
+# Why: score vs reward is split deliberately: score is raw RM output, reward is
+#   post KL-in-reward penalty — if they diverge, the adaptive KL controller is
+#   overcorrecting. Advantage mean~0 / std meaningful is the first sanity signal
+#   for GRPO group-norm or GAE. vf_explained_var near 0 means the critic has
+#   collapsed; near 1 means it's tracking returns well.
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.

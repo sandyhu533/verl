@@ -321,6 +321,38 @@ class DataProto:
     It contains a batch (TensorDict) and a meta_info (Dict). The batch is a TensorDict https://pytorch.org/tensordict/.
     TensorDict allows you to manipulate a dictionary of Tensors like a single Tensor. Ideally, the tensors with the
     same batch size should be put inside batch.
+
+    ============================================================
+    [学习注释] DataProto 三字段模型
+    ============================================================
+
+    verl 所有跨函数/跨 worker 的数据都以 DataProto 为载体。三个字段的分工：
+
+      batch             : TensorDict —— 定长张量
+          典型字段：input_ids / attention_mask / position_ids / responses /
+                    old_log_probs / ref_log_probs / advantages / returns / values
+          所有张量在 dim 0 必须一致 = batch size
+
+      non_tensor_batch  : dict[str, np.ndarray(dtype=object)] —— 不定长 Python 对象
+          典型字段：raw_prompt / raw_prompt_ids / tools_kwargs / ground_truth /
+                    data_source / ability / reward_model / extra_info
+          必须是 object ndarray（不是 list），dim 0 要和 batch 一致
+
+      meta_info         : dict[str, Any] —— 全 batch 共享的标量/元数据
+          典型字段：eos_token_id / global_step / temperature / metrics
+          没有 batch 维度，不参与 chunk/select 切分
+
+    关键不变式（由 check_consistency 强制）：
+      - batch 和 non_tensor_batch 在 dim 0 必须匹配
+      - non_tensor_batch 的每个 value 必须是 np.ndarray
+
+    常用操作：
+      from_dict     构造
+      select/pop    列级投影
+      union         合并另一个 DataProto 的字段（重名必须等值）
+      chunk(N)      行级切分，分发给 N 个 worker（meta_info 广播共享）
+      concat(list)  对称 collect，metrics 字段做聚合
+      repeat(N)     每条样本复制 N 份（GRPO rollout.n 基础）
     """
 
     batch: TensorDict = None
@@ -454,11 +486,20 @@ class DataProto:
     def check_consistency(self):
         """Check the consistency of the DataProto. Mainly for batch and non_tensor_batch
         We expose this function as a public one so that user can call themselves directly
+
+        [学习注释] DataProto 不变式校验。__post_init__ 自动调用，但用户也能随时手动跑。
+        三条规则：
+          1. batch 必须是单 batch 维度（batch_size shape 长度 = 1）
+          2. non_tensor_batch 的每个 value 必须是 np.ndarray（不是 list/tuple）
+          3. batch 和 non_tensor_batch 都非空时，两者在 dim 0 必须相等
         """
         if self.batch is not None:
+            # [学习注释] 规则 1：只允许单 batch 维度
+            # batch_size 是 torch.Size，例如 torch.Size([256]) 合法，torch.Size([256, 4]) 不合法
             assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1"
 
         if self.non_tensor_batch is not None:
+            # [学习注释] 规则 2：强制 ndarray。从 list 构造的话应该走 from_dict 让它自动转换
             for key, val in self.non_tensor_batch.items():
                 assert isinstance(val, np.ndarray)
 
@@ -466,6 +507,7 @@ class DataProto:
             # TODO: we can actually lift this restriction if needed
             assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1 when non_tensor_batch is not empty."
 
+            # [学习注释] 规则 3：跨字段 dim 0 一致性检查
             batch_size = self.batch.batch_size[0]
             for key, val in self.non_tensor_batch.items():
                 assert isinstance(val, np.ndarray), (
@@ -504,10 +546,18 @@ class DataProto:
         """Create a DataProto from a dict of tensors. This assumes that
         1. All the tensor in tensors have the same dim0
         2. Only dim0 is the batch dim
+
+        [学习注释] 标准构造器。几乎所有构造 DataProto 的场景都走这里。
+        职责：
+          - 自动校验所有 tensor 的 dim 0 一致（用第一个 tensor 定基准 batch_size）
+          - 自动把 list 形式的 non_tensors 转成 object ndarray
+          - 把 tensors dict 打包成 TensorDict
+          - 可选：打开 auto_padding 标记，允许 chunk 时自动 pad 到整除
         """
 
         assert num_batch_dims > 0, "num_batch_dims must be greater than zero"
         if non_tensors is not None:
+            # [学习注释] non_tensors 只支持单 batch 维度（numpy object array 本身有限制）
             assert num_batch_dims == 1, "only support num_batch_dims=1 when non_tensors is not None."
 
         if tensors is None:
@@ -520,25 +570,32 @@ class DataProto:
         assert isinstance(non_tensors, dict)
 
         # get and check batch size
+        # [学习注释] 用第一个 tensor 的 shape 定基准，后续所有 tensor 必须匹配
         batch_size = None
         pivot_key = None
         for key, tensor in tensors.items():
             if batch_size is None:
+                # [学习注释] 取前 num_batch_dims 维作为 batch_size（默认就是 dim 0）
                 batch_size = tensor.shape[:num_batch_dims]
                 pivot_key = key
             else:
                 current_batch = tensor.shape[:num_batch_dims]
+                # [学习注释] 不一致立即报错 —— 防止后续神秘的 shape mismatch
                 assert batch_size == current_batch, (
                     f"Not all the tensor in tensors have the same batch size with batch_dims={num_batch_dims}. "
                     f"Got {pivot_key} has {batch_size}, {key} has {current_batch}"
                 )
 
+        # [学习注释] non_tensors 的 list/tuple 自动转 object ndarray
+        # 这样用户传 list 也能用，不需要手动 np.array(..., dtype=object)
         for key, val in non_tensors.items():
             if not isinstance(val, np.ndarray):
                 non_tensors[key] = np.array(val, dtype=object)
 
+        # [学习注释] TensorDict 的构造；空 tensors 时整体 batch=None
         tensor_dict = TensorDict(source=tensors, batch_size=batch_size) if tensors else None
         if auto_padding:
+            # [学习注释] 打标：chunk(N) 时即使 len % N != 0 也允许（自动 pad）
             meta_info[DataProtoConfig.auto_padding_key] = True
         return cls(batch=tensor_dict, non_tensor_batch=non_tensors, meta_info=meta_info)
 
@@ -600,6 +657,13 @@ class DataProto:
     def select(self, batch_keys=None, non_tensor_batch_keys=None, meta_info_keys=None, deepcopy=False) -> "DataProto":
         """Select a subset of the DataProto via batch_keys and meta_info_keys
 
+        [学习注释] 列级投影 —— 挑几列，不改 batch 维度。
+        典型用法：rollout 只需要 input_ids/attention_mask/position_ids，不需要 advantages/returns 等，
+        所以 rollout 之前会 select 子集，减少跨 worker 传输量。
+
+        默认浅复制：返回的 DataProto 和原 DataProto 共享底层 tensor 存储，
+        调用方不能在返回值上就地修改张量（会污染原对象）。要真正隔离请设 deepcopy=True。
+
         Args:
             batch_keys (list, optional): a list of strings indicating the keys in batch to select
             meta_info_keys (list, optional): a list of keys indicating the meta info to select
@@ -610,16 +674,20 @@ class DataProto:
         # TODO (zhangchi.usc1992) whether to copy
         if batch_keys is not None:
             batch_keys = tuple(batch_keys)
+            # [学习注释] TensorDict 原生 select —— 共享存储的 view（不复制数据）
             sub_batch = self.batch.select(*batch_keys)
         else:
+            # [学习注释] None 表示保留全部 batch 列
             sub_batch = self.batch
 
         if non_tensor_batch_keys is not None:
+            # [学习注释] 过滤 non_tensor_batch —— 共享同一 ndarray 引用
             non_tensor_batch = {key: val for key, val in self.non_tensor_batch.items() if key in non_tensor_batch_keys}
         else:
             non_tensor_batch = self.non_tensor_batch
 
         if deepcopy:
+            # [学习注释] 真正复制数据，避免下游就地修改污染原对象
             non_tensor_batch = copy.deepcopy(non_tensor_batch)
 
         if meta_info_keys is not None:
@@ -786,12 +854,26 @@ class DataProto:
         - the batch size of two data batch is not the same
         - there are conflict keys in meta_info and they are not the same.
 
+        [学习注释] 把 other 的字段合并进 self（in-place，并返回 self）。
+        verl 里最常见的聚合操作之一：
+
+          prompt_batch (有 input_ids, attention_mask, ...)
+            ↓ rollout
+          rollout_batch (有 responses, old_log_probs, ...)
+            ↓ prompt_batch.union(rollout_batch)
+          合并后 batch 同时包含 prompt 和 rollout 两批字段
+
+        严格模式：重名 key 必须值完全相等，否则报错。
+        这样能防止多阶段拼装时 "advantage 被谁悄悄覆盖了" 的玄学 bug。
+
         Args:
             other (DataProto): another DataProto to union
 
         Returns:
             DataProto: the DataProto after union
         """
+        # [学习注释] 三类字段分别合并：tensor / numpy / 纯 python dict
+        # 任一类出现冲突（key 重复且值不等）都会抛异常
         self.batch = union_tensor_dict(self.batch, other.batch)
         self.non_tensor_batch = union_numpy_dict(self.non_tensor_batch, other.non_tensor_batch)
         self.meta_info = union_two_dict(self.meta_info, other.meta_info)
@@ -864,6 +946,14 @@ class DataProto:
     def chunk(self, chunks: int) -> list["DataProto"]:
         """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
 
+        [学习注释] 行级切分 —— M2 single_controller 的 dispatch 机制的基石。
+        driver 侧调 actor_rollout_wg.generate_sequences(batch) 时，dispatch 函数
+        会调 batch.chunk(world_size) 把数据按 worker 数等分发出去。
+
+        ⚠️ 重要细节：meta_info 不切 —— N 个 shard 共享同一个 dict 引用。
+        这既是性能优化（不复制广播型元数据），也是坑 —— worker 不能就地改 meta_info，
+        否则会污染其他 shard 看到的内容。要改应当在 concat 回来之后在 driver 改。
+
         Args:
             chunks (int): the number of chunks to split on dim=0
 
@@ -871,29 +961,38 @@ class DataProto:
             List[DataProto]: a list of DataProto after splitting
         """
         if not self.is_padding_enabled():
+            # [学习注释] 默认要求精确整除。auto_padding 模式下会容忍，由外层自行 pad
             assert len(self) % chunks == 0, (
                 f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
             )
 
         bsz_in_batch = None
         if self.batch is not None:
+            # [学习注释] TensorDict 原生 chunk —— 底层是 torch.chunk，view 而非 copy
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)
+            # [学习注释] 记录每块实际 size（不一定均等，torch.chunk 的最后一块可能偏小）
             bsz_in_batch = np.array([batch.batch_size[0] for batch in batch_lst])
+            # [学习注释] 累积分割点，用于 numpy 侧对齐切分
             chunk_indices = np.cumsum(bsz_in_batch)[:-1]
         else:
+            # [学习注释] 没有 tensor batch 时，每块 batch 设 None
             batch_lst = [None for _ in range(chunks)]
 
+        # [学习注释] 切 non_tensor_batch，要保证每个 key 和 batch 的分割点对齐
         non_tensor_batch_lst = [{} for _ in range(chunks)]
         for key, val in self.non_tensor_batch.items():
             assert isinstance(val, np.ndarray)
             if bsz_in_batch is not None:
+                # [学习注释] 用 batch 的精确分割点切 numpy，保证对齐
                 non_tensor_lst = np.array_split(val, chunk_indices.tolist())
             else:
+                # [学习注释] 无 batch 时，numpy 自己均分
                 non_tensor_lst = np.array_split(val, chunks)
             assert len(non_tensor_lst) == chunks
             for i in range(chunks):
                 non_tensor_batch_lst[i][key] = non_tensor_lst[i]
 
+        # [学习注释] 逐 shard 构造 DataProto；注意每个 shard 的 meta_info 都指向同一对象
         output = []
         for i in range(chunks):
             output.append(
@@ -918,22 +1017,34 @@ class DataProto:
         """Concat a list of DataProto. The batch is concatenated among dim=0.
         The meta_info is merged, with special handling for metrics from different workers.
 
+        [学习注释] 行级收集 —— chunk 的对称操作，M2 dispatch/collect 的 collect 端。
+        N 个 worker 各算完自己的 shard 后，driver 侧调 DataProto.concat(returns) 拼回。
+
+        meta_info 合并的两条规则：
+          1. 普通 key："重名必须值完全相等"，否则报错（防止 worker 间不一致被静默吞）
+          2. 特殊 key "metrics"：聚合所有 worker 的 metrics，最终转成 dict[str, list]
+             例如 worker0: {"loss": 0.5}, worker1: {"loss": 0.4}
+             → 聚合后 metrics = {"loss": [0.5, 0.4]}
+
         Args:
             data (List[DataProto]): list of DataProto
 
         Returns:
             DataProto: concatenated DataProto
         """
+        # [学习注释] tensor batch：走 torch.cat
         batch_lst = []
         for batch in data:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
+        # [学习注释] non_tensor_batch：先把 list[dict] 转置成 dict[list]，再逐 key np.concatenate
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         # Merge meta_info with special handling for metrics
+        # [学习注释] meta_info 合并逻辑
         merged_meta_info = {}
         if data:
             # Merge non-metric meta_info and aggregate metrics from all workers.
@@ -941,12 +1052,14 @@ class DataProto:
             for d in data:
                 for k, v in d.meta_info.items():
                     if k == "metrics":
+                        # [学习注释] metrics 聚合（不要求一致）—— 每个 worker 的 metric 都保留
                         if v is not None:
                             if isinstance(v, list):
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
                     else:
+                        # [学习注释] 非 metrics：严格一致检查
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
                             assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
@@ -955,8 +1068,11 @@ class DataProto:
 
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
+                # [学习注释] [{"loss": 0.5}, {"loss": 0.4}] → {"loss": [0.5, 0.4]}
+                # 方便下游统一做 mean/std/min/max 聚合
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
 
+        # [学习注释] 用第 0 个元素的类（支持子类），空 list 则用 DataProto
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
 
@@ -972,6 +1088,17 @@ class DataProto:
         """
         Repeat the batch data a specified number of times.
 
+        [学习注释] 每条样本复制 N 份 —— GRPO rollout.n 的基础。
+        典型用法（GRPO 场景 rollout.n=5, batch_size=256）：
+          prompt_batch.repeat(5, interleave=True)
+          → batch_size 从 256 变 1280，每个 prompt 连续出现 5 次
+
+        interleave=True 为什么重要：
+          [a, b, c] + repeat(2, interleave=True) → [a, a, b, b, c, c]
+          [a, b, c] + repeat(2, interleave=False) → [a, b, c, a, b, c]
+        GRPO 组基线要求组内 5 条样本在 batch 中连续排布，后续才能
+        `rewards.view(-1, n).mean(-1)` 直接算组均值；否则要先 reorder。
+
         Args:
             repeat_times (int): Number of times to repeat the data.
             interleave (bool): Whether to interleave the repeated data.
@@ -982,16 +1109,20 @@ class DataProto:
         if self.batch is not None:
             if interleave:
                 # Interleave the data
+                # [学习注释] repeat_interleave：[a, b, c] → [a, a, b, b, c, c]
                 repeated_tensors = {
                     key: tensor.repeat_interleave(repeat_times, dim=0) for key, tensor in self.batch.items()
                 }
             else:
                 # Stack the data
+                # [学习注释] 整体 tile：[a, b, c] → [a, b, c, a, b, c]
+                # 先 unsqueeze 成 [1, B, ...]，expand 复制到 [N, B, ...]，再 reshape 回 [N*B, ...]
                 repeated_tensors = {
                     key: tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
                     for key, tensor in self.batch.items()
                 }
 
+            # [学习注释] 构造新的 TensorDict，batch_size 扩大 repeat_times 倍
             repeated_batch = TensorDict(
                 source=repeated_tensors,
                 batch_size=(self.batch.batch_size[0] * repeat_times,),
@@ -999,17 +1130,20 @@ class DataProto:
         else:
             repeated_batch = None
 
+        # [学习注释] non_tensor_batch 同理（numpy 版本）
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
             if interleave:
+                # [学习注释] np.repeat 等价 tensor.repeat_interleave
                 repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
             else:
+                # [学习注释] np.tile 等价整体复制，注意要构造 (N, 1, 1, ...) 的 tile 规格
                 repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
 
         return type(self)(
             batch=repeated_batch,
             non_tensor_batch=repeated_non_tensor_batch,
-            meta_info=self.meta_info,
+            meta_info=self.meta_info,     # [学习注释] meta_info 共享引用（与 chunk 行为一致）
         )
 
     def unfold_column_chunks(self, n_split: int, split_keys: Optional[list[str]] = None):

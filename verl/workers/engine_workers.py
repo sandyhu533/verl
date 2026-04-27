@@ -73,13 +73,112 @@ def _with_routing_replay_flag(enabled: bool):
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
-    """
-    TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
-    to a single controller. Currently, we only provide more coarse grained APIs,
-    and do not provide exact APIs as Tinker does. But this can be added in the future.
+    """Engine-agnostic trainable Ray worker shared by actor, critic, and ref-policy roles.
+
+    What
+
+      - Tinker-like RayWorkerGroup facade (https://thinkingmachines.ai/tinker/) exposing
+        coarse-grained RPCs (train_batch, infer_batch, save/load_checkpoint, to) to the
+        single-controller trainer.
+      - Holds a single `self.engine: BaseEngine` constructed via `EngineRegistry.new(...)`;
+        all forward/backward/step/offload work is delegated there, so this class is pure
+        orchestration and metric plumbing (DP all-reduce of loss, all-gather of metrics,
+        MFU via FlopsCounter).
+
+    Lifecycle
+
+      - `__init__`: initialize Ray PG, NUMA pin, resolve engine+optim configs (optionally
+        via `auto_select_engine_optim_fn`), instantiate BaseEngine, register train-mesh
+        dispatch info, build FlopsCounter.
+      - `reset()`: lazy `engine.initialize()` (allocate params/optimizer/grad buffers).
+      - `set_loss_fn()`: inject ppo/diffusion/distillation loss closure from parent.
+      - Steady state: `train_mini_batch` -> chunks into `train_batch` micro-steps under
+        `engine.train_mode()`; `infer_batch` under `engine.eval_mode()` with optional
+        `disable_adapter()` for LoRA ref-like paths.
+
+    Called by
+
+      - `ActorRolloutRefWorker.init_model` constructs one TrainingWorker per sub-role
+        (actor, ref) locally — not via Ray — so methods run in-process on the outer
+        hybrid worker's GPUs.
+      - Future CriticWorker / standalone ActorWorker paths reuse this same class.
+
+    Call graph (THIS ENTITY)
+
+      - train_mini_batch -> make_iterator -> train_batch -> engine.train_batch(loss_fn)
+        -> _postprocess_output (DP all-reduce loss, allgather_dict_into_dict metrics,
+        FlopsCounter.estimate_flops -> mfu).
+      - infer_batch -> engine.infer_batch -> _postprocess_output (forward_only mfu /= 3).
+      - save_checkpoint / load_checkpoint / to -> engine.*.
+
+    Branches
+
+      - `engine_config.strategy` in {"fsdp", "fsdp2", "megatron", "torchtitan"} selects
+        the BaseEngine subclass via EngineRegistry; this class is unaware of which.
+      - NPU path sets `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` (torch_npu lacks
+        `set_expandable_segments`).
+      - `is_mp_src_rank_with_outputs()` gates whether non-TP-src ranks materialize
+        `final_output` (TP/PP ranks return None to save serialization).
+
+    Why
+
+      - Replaces per-backend duplication in legacy `fsdp_workers.py`: actor/critic/ref
+        RPC surface is written once here; swapping FSDP<->Megatron<->TorchTitan is a
+        config flip, matching HybridFlow's engine-abstraction goal.
+      - Keeps scheduling (single controller) decoupled from parallelism strategy so the
+        trainer's `.update_actor(...)` stays identical across backends.
     """
 
     def __init__(self, config: TrainingWorkerConfig):
+        """Wire up config, registries, and profiler — but do NOT build the engine yet.
+
+        What
+
+          - Stash the `TrainingWorkerConfig` sub-fields (model / engine / optimizer /
+            checkpoint) onto `self`, initialize Ray's global process group, set NUMA
+            affinity, and construct `self.engine = EngineRegistry.new(...)` — the
+            backend-specific BaseEngine (FSDP / Megatron / TorchTitan / VeOmni / ...).
+          - Register this worker's dispatch/collect info under mesh_name="train" so
+            the single controller can route `DP_COMPUTE_PROTO` RPCs onto its DP ranks.
+
+        Lifecycle
+
+          - Called once when this object is instantiated (either as a plain Python
+            object inside `ActorRolloutRefWorker.init_model`, or as a Ray actor for
+            the SFT trainer / standalone critic path).
+          - `self.engine` is CONSTRUCTED here but NOT initialized; param / optimizer
+            / grad allocation happens later in `reset()`.
+          - `self.loss_fn` starts as None; the parent injects it via `set_loss_fn()`.
+
+        Called by
+
+          - `ActorRolloutRefWorker.init_model` builds `self.actor = TrainingWorker(...)`
+            and `self.ref = TrainingWorker(...)` in-process.
+          - `main_ppo.py` aliases `CriticWorker = TrainingWorker` under the
+            `use_legacy_worker_impl="disable"` path.
+          - `sft_trainer[_ray].py` uses it standalone as `self.training_client`.
+
+        Call graph (THIS ENTITY)
+
+          - __init__ -> initialize_global_process_group_ray -> set_numa_affinity
+            -> EngineRegistry.new -> _register_dispatch_collect_info(mesh="train")
+            -> FlopsCounter(hf_config).
+
+        Branches
+
+          - `engine_config is None` + `auto_select_engine_optim_fn` set: resolve
+            (engine_config, optimizer_config) from the model config at runtime.
+          - NPU: set `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` (torch_npu
+            lacks `set_expandable_segments`).
+          - Diffusion models: `flops_counter = None` (MFU not yet supported).
+
+        Why
+
+          - Keep constructor cheap and deterministic so Ray actor placement + config
+            validation are separate from heavy engine materialization. `reset()` is
+            where shards actually allocate, which the trainer can sequence across
+            actor/ref/critic to control peak memory.
+        """
         Worker.__init__(self)
 
         from verl.workers.engine import BaseEngine, EngineRegistry
@@ -154,7 +253,40 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
-        """Manual control of load/offload"""
+        """Manual offload/reload of model / optimizer / grad between device and CPU.
+
+        What
+
+          - Thin control-plane RPC that forwards to `self.engine.to(...)`; the engine
+            decides how to stream FSDP flat-params, Megatron bucketed grads, or
+            TorchTitan sharded optimizer state in/out of device memory.
+
+        Lifecycle
+
+          - Invoked by the trainer (or by `ActorRolloutRefWorker.to`) around phases
+            where VRAM must be freed — e.g. before rollout step in colocated mode,
+            or after `update_weights` to offload the actor while rollout runs.
+
+        Called by
+
+          - `ActorRolloutRefWorker.to` (same file) and higher-level offload hooks
+            in the ray trainer; `dispatch_mode=ONE_TO_ALL` so every rank executes.
+
+        Call graph (THIS ENTITY)
+
+          - to -> engine.to(device, model, optimizer, grad).
+
+        Branches
+
+          - `device == "device"` is resolved to the concrete device name (cuda/npu)
+            via `get_device_name()` before forwarding.
+
+        Why
+
+          - HybridFlow's 3D-HybridEngine co-locates train+rollout, so explicit
+            offload toggles (rather than implicit auto-offload) are required to
+            shape peak-memory around rollout's KV cache.
+        """
         assert device in ["cpu", "device"]
 
         if device == "device":
@@ -164,24 +296,126 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
+        """Install the loss callable consumed by train_batch / train_mini_batch.
+
+        What
+
+          - Stash a loss closure (e.g. `partial(ppo_loss, config=actor_config)`,
+            `diffusion_loss`, or `distillation_ppo_loss`) onto `self.loss_fn`.
+          - `train_batch` passes it to `engine.train_batch(data, loss_function=...)`;
+            the engine calls it per micro-batch with model_outputs + labels.
+
+        Lifecycle
+
+          - Called once, immediately after `reset()`, by the parent
+            `ActorRolloutRefWorker.init_model` (`self.actor.set_loss_fn(self.loss_fn)`).
+          - Ref workers never get a loss_fn installed (they only run `infer_batch`
+            with `compute_loss=False`), which matches the `loss_fn is None` assert
+            inside `train_batch`.
+
+        Called by
+
+          - `ActorRolloutRefWorker.set_loss_fn` (same file) on the actor only.
+
+        Call graph (THIS ENTITY)
+
+          - set_loss_fn -> attribute assignment; consumed later by train_batch.
+
+        Branches
+
+          - None; pure setter.
+
+        Why
+
+          - Keeps `TrainingWorker` loss-agnostic so the same class serves PPO,
+            SFT, diffusion, and distillation without subclassing.
+        """
         self.loss_fn = loss_fn
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
-        """
-        Reset the model engine to the initial state. If the engine is not initialized,
-        we initialize it. Otherwise, reload ckpt and reset states
+        """Materialize the BaseEngine: allocate params / optimizer / grad buffers.
+
+        What
+
+          - Calls `self.engine.initialize()`, which is where the backend actually
+            builds the model: FSDP flat-param wrapping, Megatron parallel state +
+            distributed optimizer, TorchTitan parallelize_module passes, etc.
+          - Separates cheap construction (in `__init__`) from expensive allocation
+            so the trainer can sequence actor/ref/critic builds to cap peak memory.
+
+        Lifecycle
+
+          - Called exactly once per TrainingWorker by `ActorRolloutRefWorker.init_model`
+            right after `TrainingWorker(...)` construction (`self.ref.reset()` then
+            `self.actor.reset()`), before any data-plane RPC.
+          - After this call, the engine is ready for `train_batch` / `infer_batch`
+            and `get_dispatch_collect()` can be queried by the parent to re-register
+            the "actor" / "ref" dispatch mesh aliases.
+
+        Called by
+
+          - `ActorRolloutRefWorker.init_model` at lines `self.ref.reset()` /
+            `self.actor.reset()`; `dispatch_mode=ONE_TO_ALL`.
+
+        Call graph (THIS ENTITY)
+
+          - reset -> engine.initialize (backend-specific param / optim allocation).
+
+        Branches
+
+          - Backend choice (`fsdp` / `fsdp2` / `megatron` / `torchtitan` / ...) was
+            fixed in `__init__` via EngineRegistry; this method is oblivious.
+
+        Why
+
+          - Lazy initialize hook matches HybridFlow's "build engine when trainer
+            schedules it" model and leaves room for later `reload ckpt + reset
+            states` behavior without changing the RPC surface.
         """
         self.engine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
-        """
+        """Private helper: DP-reduce loss, DP-gather metrics, compute MFU.
 
-        Args:
-            output: a dictionary containing loss, model_outputs and metrics
+        What
 
-        Returns:
+          - Pop `loss` and `metrics` from the engine's raw output dict; average
+            `loss` across the DP group via `all_reduce(AVG)`; all-gather
+            non-reduced metrics with `allgather_dict_into_dict`.
+          - Compute MFU via `FlopsCounter.estimate_flops(global_token_num, dt)`
+            divided by world_size (and /3 for forward-only since backward ~ 2x fwd).
+          - Package the surviving `model_output` TensorDict together with
+            `{"metrics": final_metrics}` for return.
 
+        Lifecycle
+
+          - Called at the tail of `train_batch` and `infer_batch`, only on ranks
+            where `engine.is_mp_src_rank_with_outputs()` is True (TP/PP non-src
+            ranks return None earlier to save serialization).
+
+        Called by
+
+          - `TrainingWorker.train_batch` (forward_only=False).
+          - `TrainingWorker.infer_batch` (forward_only=True, MFU /= 3).
+
+        Call graph (THIS ENTITY)
+
+          - _postprocess_output -> all_reduce(loss) -> allgather_dict_into_dict
+            -> FlopsCounter.estimate_flops -> tu.get_tensordict.
+
+        Branches
+
+          - `dp_group is None`: skip collectives (single-DP or TP-only setup).
+          - `flops_counter is None` (diffusion path) or `global_token_num is None`:
+            skip MFU.
+          - `mtp_losses*` keys: flatten list-of-single-element sublists and average.
+
+        Why
+
+          - Centralizes the metric plumbing so both train and infer paths emit
+            identical-shape dicts into the trainer, which simplifies downstream
+            aggregation in `ray_trainer`.
         """
         # TODO: whether to log memory
         # metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024 ** 3)
@@ -234,13 +468,74 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
-        """Split a batch into N mini-batches run for multiple epochs
+        """PPO-style multi-epoch update: split a batch into mini-batches, step per mini.
 
-        Args:
-            data:
+        What
 
-        Returns:
+          - Entry point for a full PPO update over a global batch. Implements the
+            classic Schulman-2017 PPO schedule at two outer levels, leaving the
+            innermost micro-batch loop to `engine.train_batch`:
 
+              for epoch in range(ppo_epochs):            # handled here via `epochs`
+                for mini_batch in split(batch, mini_bs): # this method
+                  for micro_batch in split(mini, micro_bs):  # inside engine.train_batch
+                    loss.backward()
+                  optimizer.step()  # at mini-batch boundary -> update_lr_scheduler
+
+          - optimizer.step happens ONCE per mini-batch (not per micro) — the flag
+            `update_lr_scheduler=(batch_idx == total_num_iterations - 1)` triggers
+            the lr scheduler tick at the end of the whole train_mini_batch call,
+            while the engine's internal micro-batch loop handles grad accumulation.
+
+        Lifecycle
+
+          - Called once per PPO optimization step from the trainer, after advantage
+            computation and log-prob rollout. Runs under `engine.train_mode()`
+            context so activation ckpt / grad-enabled / FSDP train mode are set.
+          - Emits aggregated metrics (loss, grad_norm, lr, kl, etc.) flattened
+            across DP + micro-batches via `_postprocess_output` inside `train_batch`,
+            then one more outer aggregation here via `Metric.aggregate_dp`.
+
+        Called by
+
+          - `ActorRolloutRefWorker.update_actor` -> `self.actor.train_mini_batch(data)`.
+          - `ray_trainer.RayPPOTrainer` / `main_ppo_sync` -> `critic_wg.train_mini_batch(batch)`
+            (when `CriticWorker = TrainingWorker` alias is active).
+          - `tests/models/test_diffusers_fsdp_engine.py` for the diffusion PPO path.
+          - `dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train")`:
+            TrainingWorker owns a "train" mesh, and `ActorRolloutRefWorker.init_model`
+            re-registers it as "actor" / "ref" mesh via `set_dispatch_collect(...)`
+            so the single controller can route DP chunks correctly through the
+            outer hybrid worker.
+
+        Call graph (THIS ENTITY)
+
+          - train_mini_batch
+            -> tu.make_iterator (DP-rank-seeded shuffle)
+            -> engine.train_mode() context
+            -> loop: train_batch(mini_batch_td)
+                  -> engine.train_batch(loss_fn)  # inner micro-batch loop + step
+                  -> _postprocess_output
+            -> Metric.aggregate_dp across micro-batch outputs
+            -> return TensorDict({"metrics": ...}) on src rank, None elsewhere.
+
+        Branches
+
+          - `mini_batch_size` XOR `num_mini_batch`: one must be provided; the other
+            is derived from the per-DP batch size.
+          - `"input_ids" in mini_batch_td`: language-model path all-gathers
+            `global_token_num` across DP for MFU; diffusion path skips this.
+          - `is_mp_src_rank_with_outputs()`: non-src ranks return None (save serde).
+          - `disable_auto_offload` is forced True for inner `train_batch` calls so
+            the engine doesn't offload between micro-batches within one mini.
+
+        Why
+
+          - Keeping the mini-batch loop here (rather than inside the engine) lets
+            the single controller observe per-mini-batch metrics for logging /
+            early-stop decisions, while still amortizing optimizer step + lr
+            scheduler across micro-batches, which is the performance-correct
+            PPO recipe (InstructGPT §C.2).
         """
         maybe_fix_3d_position_ids(data)
         batch_size_per_dp = data.shape[0]
@@ -325,6 +620,54 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
     def train_batch(self, data: TensorDict) -> TensorDict:
+        """Single forward+backward train step — no outer mini-batch loop.
+
+        What
+
+          - Run one training pass on `data`: forward under `engine.train_mode()`,
+            compute loss via the installed `self.loss_fn`, backward + optimizer
+            step handled by the engine's internal micro-batch loop, then
+            post-process metrics (DP reduce loss, MFU, optional lr update).
+          - Used both as the inner step of `train_mini_batch` and as a direct
+            public RPC for the SFT trainer (which does its own dataloader loop).
+
+        Lifecycle
+
+          - When called from `train_mini_batch`, `disable_auto_offload=True` is
+            already set so the engine stays resident across mini-batches.
+          - `update_lr_scheduler` is True only at the last micro-batch iteration
+            of the enclosing mini-batch; the engine ticks the scheduler then.
+
+        Called by
+
+          - `TrainingWorker.train_mini_batch` (internal).
+          - `sft_trainer[_ray].py` -> `self.training_client.train_batch(data)`.
+          - `tests/models/test_engine.py` for PPO engine smoke tests.
+          - `dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train")`.
+
+        Call graph (THIS ENTITY)
+
+          - train_batch
+            -> engine.train_mode() context
+            -> engine.train_batch(data, loss_function=self.loss_fn)  # micro loop
+            -> engine.lr_scheduler_step (if update_lr_scheduler)
+            -> _postprocess_output (src rank only).
+
+        Branches
+
+          - `engine_config.forward_only`: asserted False (ref workers must not
+            call train_batch).
+          - `is_mp_src_rank_with_outputs()`: non-src returns None.
+          - Default engineering keys (`use_remove_padding`, `use_dynamic_bsz`,
+            `max_token_len_per_gpu`, `micro_batch_size_per_gpu`, `use_fused_kernels`)
+            injected if not already in `data`.
+
+        Why
+
+          - Keeps the raw "one training step" primitive exposed so non-PPO trainers
+            (SFT, unit tests) can reuse it without paying for the mini-batch loop,
+            while PPO composes it through `train_mini_batch`.
+        """
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
         # global_token_num should be a list of number of tokens of each seq in this batch
@@ -380,6 +723,56 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
+        """No-grad forward: produce log-probs / values / (optional) eval loss.
+
+        What
+
+          - Forward-only pass under `engine.eval_mode()` (no grads, no activation
+            retention) used to compute per-token log-probs for the policy (actor)
+            and reference (ref) models, and values for the critic.
+          - Because activations aren't kept, the engine can safely run with larger
+            `infer_max_token_len_per_gpu` / `infer_micro_batch_size_per_gpu` than
+            the training path — the `default_keys` dict uses the `infer_*` fields.
+
+        Lifecycle
+
+          - Called during the rollout evaluation phase of each PPO iteration,
+            after rollout generation and before advantage / KL computation.
+          - Emits metrics with `forward_only=True` so `_postprocess_output`
+            divides MFU by 3 to approximate fwd-only vs fwd+bwd ratio.
+
+        Called by
+
+          - `ActorRolloutRefWorker.compute_log_prob` -> `self.actor.infer_batch(data)`.
+          - `ActorRolloutRefWorker.compute_ref_log_prob` -> `self.ref.infer_batch(data)`.
+          - `ray_trainer` / `main_ppo_sync` -> `critic_wg.infer_batch(batch)` for
+            `compute_values` when `CriticWorker = TrainingWorker`.
+          - `sft_trainer[_ray].py` -> validation pass.
+          - `dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train")`.
+
+        Call graph (THIS ENTITY)
+
+          - infer_batch
+            -> engine.eval_mode() context
+            -> [optional engine.disable_adapter() if no_lora_adapter]
+            -> engine.infer_batch(data, loss_function=...)
+            -> _postprocess_output(forward_only=True).
+
+        Branches
+
+          - `compute_loss` (True by default): pass `self.loss_fn` so SFT validation
+            can evaluate loss in eval mode; ref-log-prob paths set it False.
+          - `no_lora_adapter`: open `engine.disable_adapter()` context so that a
+            LoRA-adapted actor can produce "base-model" log-probs for the ref
+            computation (avoids maintaining a separate ref model with LoRA).
+          - `is_mp_src_rank_with_outputs()`: non-src returns None.
+
+        Why
+
+          - Mirrors InstructGPT §3's rollout-eval log-prob pattern; keeping it
+            under engine.eval_mode() with no_grad is what lets rollout + log-prob
+            + ref-log-prob all fit on the same GPUs in 3D-HybridEngine colocation.
+        """
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
@@ -426,23 +819,182 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        """Delegate to `engine.save_checkpoint` — each rank writes its own shard.
+
+        What
+
+          - Per-rank sharded checkpoint write: FSDP writes flat-param shards,
+            Megatron writes TP/PP-partitioned shards, TorchTitan writes DCP
+            sharded tensors. `max_ckpt_to_keep` rotates older checkpoint dirs.
+
+        Lifecycle
+
+          - Called from `ActorRolloutRefWorker.save_checkpoint` (actor role only)
+            at the trainer's checkpoint cadence; `dispatch_mode=ONE_TO_ALL`.
+
+        Called by
+
+          - `ActorRolloutRefWorker.save_checkpoint` (same file), which asserts
+            `"actor" in self.role` before delegating.
+
+        Call graph (THIS ENTITY)
+
+          - save_checkpoint -> engine.save_checkpoint(local, hdfs, step, keep).
+
+        Branches
+
+          - None at this layer; backend-specific logic lives in the engine.
+
+        Why
+
+          - Sharded write avoids rank-0 gather, which is prohibitive at
+            tens-of-B-param scale. Matches Megatron / TorchTitan / FSDP DCP
+            conventions so resharding-on-load is feasible.
+        """
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        """Delegate to `engine.load_checkpoint` — each rank reads its own shard.
+
+        What
+
+          - Per-rank sharded checkpoint read matching the layout written by
+            `save_checkpoint`. `del_local_after_load=True` frees the local
+            checkpoint dir after the shard is materialized into the engine.
+
+        Lifecycle
+
+          - Called from `ActorRolloutRefWorker.load_checkpoint` (actor role only)
+            at trainer startup / resume; `dispatch_mode=ONE_TO_ALL`.
+
+        Called by
+
+          - `ActorRolloutRefWorker.load_checkpoint` (same file), which asserts
+            `"actor" in self.role` before delegating.
+
+        Call graph (THIS ENTITY)
+
+          - load_checkpoint -> engine.load_checkpoint(local, hdfs, del_local).
+
+        Branches
+
+          - None at this layer; resharding / mapping lives in the engine.
+
+        Why
+
+          - Mirrors `save_checkpoint`'s sharded layout so resume cost is
+            O(shard_size / rank) rather than rank-0-bottlenecked.
+        """
         return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
-    """Hybrid worker that includes actor model, rollout and optional ref model.
-    For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
+    """Unified engine-agnostic hybrid worker: actor + rollout + ref_policy in one Ray actor.
 
-    NOTE: ActorRolloutRefWorker no longer support spmd mode and run native server mode.
+    What
+
+      - The new `use_legacy_worker_impl=False` replacement for
+        `verl.workers.fsdp_workers.ActorRolloutRefWorker`. Same 3-in-1 co-location as
+        HybridFlow 3D-HybridEngine, but built on `TrainingWorker` + `BaseEngine` so
+        the training backend (FSDP / Megatron / TorchTitan) is chosen at config time
+        via `config.actor.strategy` instead of being hard-wired into this class.
+      - Owns up to three sub-components:
+          - `self.actor: TrainingWorker`   (trainable policy, `ppo_loss` / `diffusion_loss`
+            / `distillation_ppo_loss`),
+          - `self.ref:   TrainingWorker`   (frozen forward-only reference, MTP disabled),
+          - `self.rollout: BaseRollout`    (vLLM / SGLang / TRT-LLM inference engine).
+
+    Lifecycle
+
+      - `__init__`: parse `role` bitfield (_is_actor/_is_rollout/_is_ref), build profiler,
+        detect Megatron router_replay to toggle `enable_routing_replay` decorator.
+      - `init_model`: build ref -> actor -> rollout -> checkpoint engine in that order,
+        registering per-sub-role dispatch meshes ("ref", "actor") with the single
+        controller; ends with `aggressive_empty_cache` so colocated vLLM sees free VRAM.
+      - Steady state: `compute_ref_log_prob`, `compute_log_prob`, `update_actor`,
+        `update_weights` (trainer->rollout param sync), `save/load_checkpoint`.
+
+    Called by
+
+      - `verl.trainer.ppo.ray_trainer.RayPPOTrainer` via its RayWorkerGroup when
+        `config.actor.use_legacy_worker_impl` is False (selected in main_ppo's worker
+        resolution path; legacy users still land in `fsdp_workers.py`).
+
+    Call graph (THIS ENTITY)
+
+      - update_actor -> actor.train_mini_batch -> (TrainingWorker call graph).
+      - compute_log_prob / compute_ref_log_prob -> {actor,ref}.infer_batch.
+      - update_weights -> actor.engine.get_per_tensor_param -> rollout.update_weights
+        (sync path) OR checkpoint_engine.send_weights (async/disaggregated path).
+
+    Branches
+
+      - `config.actor.strategy`: "fsdp"/"fsdp2"/"megatron"/"torchtitan" -> propagated
+        through `TrainingWorkerConfig` into each `TrainingWorker.engine`.
+      - Megatron-only: `enable_routing_replay` gates MoE router replay via
+        `_with_routing_replay_flag` on compute/update RPCs.
+      - `checkpoint_engine.backend != "naive"`: async/disaggregated rollout -> weights
+        shipped via CheckpointEngine; else colocated path resumes rollout, NCCL-syncs
+        params, re-offloads actor, resumes KV cache.
+      - LoRA: `peft_merge=True` merges adapters (single update); else two-phase base+
+        adapter sync with `base_sync_done` guard.
+
+    Why
+
+      - HybridFlow §4 "3D-HybridEngine" argues co-locating train + rollout on the same
+        GPUs wins on memory/bandwidth but needs a backend-abstract trainer. The legacy
+        class hard-coded FSDP. This unified class delegates to `TrainingWorker.engine`,
+        so the same RPC surface works for Megatron 3D-parallel training or TorchTitan
+        without changing the trainer's control flow.
     """
 
     def __init__(
         self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
     ):
+        """Parse the role bitfield and set up the profiler; defer all model/engine build to init_model.
+
+        What
+
+          - Decode `role` string ("actor" | "rollout" | "ref" | "actor_rollout" |
+            "actor_rollout_ref") into three boolean flags `_is_actor`, `_is_rollout`,
+            `_is_ref` that gate which sub-components get constructed later.
+          - Leave `self.actor`, `self.ref`, `self.rollout` as None placeholders; they
+            are materialized lazily in `init_model` so Ray actor placement is cheap
+            and deterministic.
+          - Build the DistProfiler by picking the profiler sub-config that matches
+            the dominant sub-role (actor > rollout > ref).
+          - Detect whether Megatron MoE router-replay is enabled, arming the
+            `_with_routing_replay_flag` decorator on compute/update paths.
+
+        Lifecycle
+
+          - Called once when Ray instantiates this actor from RayWorkerGroup.
+          - Pairs with `init_model`, which is the real heavy lifter.
+
+        Called by
+
+          - `RayPPOTrainer.init_workers` -> `RayWorkerGroup(..., cls=ActorRolloutRefWorker)`
+            -> Ray constructs this actor on each GPU and invokes `__init__`.
+
+        Call graph (THIS ENTITY)
+
+          - __init__ -> Worker.__init__ -> omega_conf_to_dataclass(ProfilerConfig)
+            -> DistProfilerExtension.__init__(DistProfiler(...)).
+
+        Branches
+
+          - Profiler source: _is_actor -> config.actor.profiler; elif _is_rollout ->
+            config.rollout.profiler; else -> config.ref.profiler.
+          - `enable_routing_replay` True only when `config.actor.strategy == "megatron"`
+            AND `megatron.router_replay.mode != "disabled"`.
+
+        Why
+
+          - Keeps Ray actor startup cheap; heavy model/engine allocation moves to
+            `init_model` so the trainer can sequence ref/actor/rollout construction
+            across workers to control peak GPU memory.
+        """
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
@@ -483,18 +1035,154 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
+        """Control-plane delegate: inject the PPO/diffusion/distillation loss closure into the actor TrainingWorker.
+
+        What
+
+          - Thin pass-through to `self.actor.set_loss_fn` so the trainer can swap
+            the loss closure at runtime without rebuilding the engine.
+          - Only touches the actor sub-worker; ref is forward-only (no loss) and
+            rollout is pure inference.
+
+        Lifecycle
+
+          - Typically unused after `init_model` (which wires loss_fn internally),
+            but exposed so experiments can override loss mid-run.
+
+        Called by
+
+          - Rare: custom trainer overrides that want a non-default loss closure.
+          - `RayPPOTrainer` does not call this directly in the standard path;
+            init_model already picks {ppo, diffusion, distillation} by config.
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> actor_rollout_wg.set_loss_fn (RayWorkerGroup dispatch)
+            -> ONE_TO_ALL broadcast -> THIS METHOD -> self.actor.set_loss_fn
+            -> TrainingWorker stores closure on self.loss_fn.
+
+        Branches
+
+          - None.
+
+        Why
+
+          - Keeps the control plane (loss choice, offload, save/load) on
+            ONE_TO_ALL while the data plane uses DP_COMPUTE_PROTO meshes.
+        """
         self.actor.set_loss_fn(loss_fn=loss_fn)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
-        """Manual control of load/offload"""
+        """Manual offload/reload of the actor sub-component (not ref, not rollout).
+
+        What
+
+          - Move the actor's model params / optimizer state / grad buffers between
+            GPU ("device") and CPU by delegating to `self.actor.to`, which forwards
+            to `TrainingWorker.engine.to`.
+          - Intentionally does NOT touch self.ref (frozen; its own `to` is managed
+            separately) and does NOT touch self.rollout (the rollout engine has
+            its own sleep/resume API exercised in `update_weights`).
+
+        Lifecycle
+
+          - Called around `update_weights` in the colocated HybridFlow path: after
+            weight sync the trainer offloads actor params to CPU so rollout's KV
+            cache can reclaim that VRAM before generation.
+          - Also called between PPO phases to keep peak memory under the
+            train+rollout colocation budget.
+
+        Called by
+
+          - `RayPPOTrainer.fit` around rollout generation / log-prob recompute.
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> actor_rollout_wg.to (RayWorkerGroup dispatch) -> ONE_TO_ALL
+            broadcast -> THIS METHOD -> self.actor.to -> engine.to(device, ...).
+
+        Branches
+
+          - `device in {"cpu", "device"}`; "device" resolves to get_device_name()
+            inside TrainingWorker.to.
+
+        Why
+
+          - HybridFlow §4 colocation: the same GPUs host both training shards and
+            rollout KV cache. Explicit `to("cpu")` is how the controller frees
+            VRAM for the inference engine without tearing down the actor.
+        """
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        """Four-phase build of the 3-in-1 hybrid worker: ref -> actor -> rollout -> checkpoint_engine.
+
+        What
+
+          - Phase 1 (ref): if _is_ref, synthesize a forward-only TrainingWorker
+            with MTP forced off and infer-side batching keys (log_prob_*) remapped
+            onto engine_config. Register dispatch info under mesh_name="ref".
+          - Phase 2 (actor): if _is_actor, build a trainable TrainingWorker, pick
+            loss_fn (distillation_ppo_loss / diffusion_loss / ppo_loss), inject it
+            via `self.actor.set_loss_fn`, register mesh_name="actor".
+          - Phase 3 (rollout): if _is_rollout, build the BaseRollout (vLLM /
+            SGLang / TRT-LLM) on a (dp, infer_tp, infer_pp) device mesh. NOTE:
+            under use_legacy_worker_impl="disable", `generate_sequences` is NOT
+            a method on this class — the trainer calls
+            `async_rollout_manager.generate_sequences(...)` via RolloutReplica.
+            So `self.rollout` here is a CONTROL-plane handle (weight sync /
+            sleep / wake in `update_weights`), not the data-generation entry.
+          - Phase 4 (checkpoint_engine): if _is_actor, instantiate from
+            CheckpointEngineRegistry. Backend "naive" means colocated NCCL sync;
+            any other backend means async/disaggregated weight push via
+            `checkpoint_engine.send_weights`.
+          - Finish with `aggressive_empty_cache(force_sync=True)` so colocated
+            vLLM sees freed VRAM via cudaMemGetInfo.
+
+        Lifecycle
+
+          - Called exactly once after __init__, before any PPO step. Allocates
+            all shards / KV cache / optimizer state on the GPU.
+
+        Called by
+
+          - `RayPPOTrainer.init_workers` -> actor_rollout_wg.init_model()
+            (ONE_TO_ALL broadcast). Legacy users land in `fsdp_workers.py`.
+
+        Call graph (THIS ENTITY)
+
+          - -> TrainingWorker(ref) -> self.ref.reset -> set_dispatch_collect("ref")
+          - -> TrainingWorker(actor) -> self.actor.reset -> actor.set_loss_fn
+            -> set_dispatch_collect("actor")
+          - -> get_rollout_class(name, mode)(...) -> self.rollout
+          - -> CheckpointEngineRegistry.new(backend, ...) -> self.checkpoint_engine
+          - -> aggressive_empty_cache(force_sync=True).
+
+        Branches
+
+          - Loss fn: distillation_enabled -> distillation_ppo_loss;
+            model_type == "diffusion_model" -> diffusion_loss; else -> ppo_loss.
+          - Checkpoint backend == "naive" vs async/disaggregated drives the
+            update_weights branch later.
+          - LoRA: `peft_merge` flag latched from `model_config.lora.merge` here
+            gates the two-phase base+adapter sync in update_weights.
+
+        Why
+
+          - Separate ref/actor meshes because they can have different TP/PP/DP
+            configs; registering per-role dispatch lets the single controller
+            route data-plane RPCs (compute_ref_log_prob vs compute_log_prob) to
+            the right shard topology.
+          - Build order matters: ref first (smallest, no optimizer), then actor
+            (peak training memory), then rollout (takes whatever VRAM is left),
+            then checkpoint_engine (pure control plane). This staging keeps peak
+            GPU memory predictable during init.
+        """
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
-        # 1. build reference model
+        # phase 1: build ref model
         if "ref" in self.role:
             # TODO: align ref config with actor config
             with open_dict(self.config.ref):
@@ -532,7 +1220,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
-        # 2. build actor model
+        # phase 2: build actor model
         if "actor" in self.role:
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
@@ -583,7 +1271,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
-        # 3. build rollout engine
+        # phase 3: build rollout engine
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
@@ -611,7 +1299,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
 
-        # 4. build checkpoint engine
+        # phase 4: build checkpoint engine
         if "actor" in self.role:
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
@@ -631,6 +1319,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        """Data-plane entry for frozen-ref forward pass; dispatched on mesh_name="ref".
+
+        What
+
+          - No-grad ref-policy forward to produce reference log-probs used in the
+            KL term of PPO. Delegates to `self.ref.infer_batch` which runs under
+            `engine.eval_mode()` in the ref TrainingWorker.
+          - Routed onto mesh_name="ref" (separate from actor's mesh) so the ref
+            model can have its own TP/PP/DP sharding independent of the actor.
+
+        Lifecycle
+
+          - Hot PPO path. Called once per rollout batch, before update_actor.
+
+        Called by
+
+          - `RayPPOTrainer.fit` -> actor_rollout_wg.compute_ref_log_prob(batch)
+            (make_nd_compute_dataproto_dispatch_fn mesh="ref").
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> DP_COMPUTE_PROTO(ref) -> THIS METHOD
+            -> self.ref.infer_batch -> engine.infer_batch (forward-only).
+
+        Branches
+
+          - `_with_routing_replay_flag(enabled=False)`: ref does NOT record MoE
+            router decisions (only actor/update paths set enabled=True to replay
+            the same expert choices across log-prob recompute and gradient step).
+          - Returns None on non-MP-src ranks; CPU-materialize on the src rank.
+
+        Why
+
+          - Thin wrapper, but sits on the hottest PPO path — the real compute
+            lives in TrainingWorker.infer_batch. Keeping this method tiny makes
+            the trainer-side RPC surface legible.
+        """
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -638,6 +1363,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        """Data-plane entry for actor no-grad forward (old-policy log-probs); dispatched on mesh_name="actor".
+
+        What
+
+          - No-grad actor forward to obtain `log_pi_theta_old` over the rollout
+            tokens. Needed for PPO's importance-sampling ratio. Delegates to
+            `self.actor.infer_batch` under `engine.eval_mode()`.
+          - Routed onto mesh_name="actor" (not "ref") so it lands on the actor's
+            TP/PP/DP shards.
+
+        Lifecycle
+
+          - Hot PPO path. Called once per rollout batch, paired with
+            compute_ref_log_prob, before update_actor.
+
+        Called by
+
+          - `RayPPOTrainer.fit` -> actor_rollout_wg.compute_log_prob(batch).
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> DP_COMPUTE_PROTO(actor) -> THIS METHOD
+            -> self.actor.infer_batch -> engine.infer_batch.
+
+        Branches
+
+          - `_with_routing_replay_flag(enabled=True)`: on MoE Megatron, the actor
+            RECORDS expert-routing decisions here so update_actor can REPLAY them
+            for a consistent gradient. Contrasts with compute_ref (enabled=False).
+          - Returns None on non-MP-src ranks; CPU-materialize on the src rank.
+
+        Why
+
+          - Thin wrapper, but sits on the hottest PPO path — real compute lives
+            in TrainingWorker.infer_batch. Separate actor-mesh dispatch from ref
+            keeps sharding topologies decoupled.
+        """
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -646,31 +1408,205 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        """Data-plane entry for the PPO gradient update; dispatched on mesh_name="actor".
+
+        What
+
+          - Run the PPO (or diffusion / distillation) gradient step on the actor
+            model by delegating to `self.actor.train_mini_batch`, which chunks
+            the batch into mini-batches, calls engine.train_batch under
+            `engine.train_mode()` with `self.loss_fn`, and all-reduces metrics.
+          - Routed onto mesh_name="actor".
+
+        Lifecycle
+
+          - Hot PPO path. Called after compute_ref_log_prob + compute_log_prob
+            produce old-policy log-probs; this is the gradient step.
+
+        Called by
+
+          - `RayPPOTrainer.fit` -> actor_rollout_wg.update_actor(batch).
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> DP_COMPUTE_PROTO(actor) -> THIS METHOD
+            -> self.actor.train_mini_batch -> (N micro-batches of) train_batch
+            -> engine.train_batch(loss_fn=ppo_loss/...) -> optimizer.step.
+
+        Branches
+
+          - `_with_routing_replay_flag(enabled=True)`: replays the MoE expert
+            routing decisions recorded during compute_log_prob so the gradient
+            is taken with respect to the SAME experts the old policy used.
+          - Returns None on non-MP-src ranks; CPU-materialize metrics on src.
+
+        Why
+
+          - Trainer-facing thin RPC; real training math lives in TrainingWorker.
+            The important design decision here is the actor-mesh dispatch +
+            routing-replay flag, both of which are backend-invariant.
+        """
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        """Control-plane delegate: restore actor weights/optimizer from local or HDFS checkpoint.
+
+        What
+
+          - Thin pass-through to `self.actor.load_checkpoint` which delegates to
+            `TrainingWorker.engine.load_checkpoint` (backend-specific: FSDP uses
+            dcp; Megatron uses distributed-save; TorchTitan uses dcp).
+          - Asserts actor role; ref is stateless (frozen from HF weights) and
+            rollout has its own weight-sync path via update_weights.
+
+        Lifecycle
+
+          - Called on resume-from-checkpoint at trainer startup, not in the hot
+            PPO loop.
+
+        Called by
+
+          - `RayPPOTrainer.fit / init_workers` ->
+            actor_rollout_wg.load_checkpoint(path) (ONE_TO_ALL).
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> actor_rollout_wg.load_checkpoint (RayWorkerGroup dispatch)
+            -> ONE_TO_ALL broadcast -> THIS METHOD -> self.actor.load_checkpoint
+            -> engine.load_checkpoint.
+
+        Branches
+
+          - `del_local_after_load=True` deletes local shards after load to save
+            disk.
+
+        Why
+
+          - Single choke point for the trainer's resume path; the backend
+            details (sharded vs replicated, format) stay hidden in the engine.
+        """
         assert "actor" in self.role, "load_checkpoint only support actor role"
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        """Control-plane delegate: persist actor weights/optimizer/rng to local or HDFS.
+
+        What
+
+          - Thin pass-through to `self.actor.save_checkpoint` which delegates to
+            `TrainingWorker.engine.save_checkpoint`.
+          - Actor-only: ref has no trainable state; rollout's weights live in
+            the inference engine and are re-derived from actor on next
+            update_weights, so they don't need independent checkpoints.
+
+        Lifecycle
+
+          - Called at configured `save_freq` intervals from the PPO loop, plus
+            on final iteration.
+
+        Called by
+
+          - `RayPPOTrainer.fit` ->
+            actor_rollout_wg.save_checkpoint(path, step) (ONE_TO_ALL).
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> actor_rollout_wg.save_checkpoint (RayWorkerGroup dispatch)
+            -> ONE_TO_ALL broadcast -> THIS METHOD -> self.actor.save_checkpoint
+            -> engine.save_checkpoint (may upload to HDFS afterward).
+
+        Branches
+
+          - `max_ckpt_to_keep` prunes older checkpoints after successful save.
+
+        Why
+
+          - Keeps the RayPPOTrainer's save path backend-agnostic; FSDP dcp,
+            Megatron distributed-save, and TorchTitan dcp all sit behind the
+            same ONE_TO_ALL RPC.
+        """
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
-        """Update weights from trainer to rollout.
+        """HybridFlow 3D-HybridEngine weight reshard: push trained actor params onto the rollout engine.
 
-        1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
-           - before update_weights: rollout should be in sleep mode.
-           - after update_weights: rollout should be in wake_up mode.
-        2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
+        What
 
-        LoRA handling: when model.lora.merge=True (peft_merge), LoRA is merged into
-        base weights before sync. The engine returns full HF-keyed params with
-        peft_config=None, so the rollout receives a standard weight update.
+          - This is HybridFlow §4's "3D-HybridEngine" weight resharding step:
+            move params from the TRAIN shard layout (e.g. FSDP/Megatron TP/PP)
+            onto the INFER shard layout (e.g. vLLM/SGLang TP) on the same GPUs.
+          - Two dispatch modes driven by `config.rollout.checkpoint_engine.backend`:
+            - "naive" (colocated): trainer and rollout share GPUs. Weights flow
+              via `engine.get_per_tensor_param` -> `rollout.update_weights`
+              (NCCL broadcast / zero-copy tensor handoff inside the process).
+            - not "naive" (async/disaggregated): rollout runs on separate GPUs.
+              Weights are shipped via `checkpoint_engine.send_weights` to a
+              remote CheckpointEngine (e.g. network blob store / RDMA), then
+              the remote rollout pulls and applies them out of band.
+          - Async dispatch_mode (`blocking=False`): returns a coroutine so the
+            trainer can overlap weight sync with other work.
+
+        Phases (colocated path)
+
+          - 0. Early return if backend != "naive" (disaggregated path).
+          - 1. `rollout.resume(tags=["weights"])` — wake the rollout engine's
+            weight slots (KV cache stays paged-out until phase 4).
+          - 2. Call `engine.get_per_tensor_param(base_sync_done=True)` to gather
+            shards into HF-keyed tensors.
+          - 3. Two-phase LoRA sync (if adapter mode, not merge):
+               3a. If `not self.base_sync_done`: first push BASE weights
+                   (`get_per_tensor_param(base_sync_done=False)` then
+                   `rollout.update_weights(..., base_sync_done=False)`).
+               3b. Then push adapter weights via second
+                   `rollout.update_weights(..., base_sync_done=True)`.
+             For `peft_merge=True`, LoRA is merged into base in the engine so
+             phase 3a is skipped and rollout sees a plain HF weight update with
+             peft_config=None.
+          - 4. Offload actor params to CPU (if `is_param_offload_enabled`) to
+            free VRAM for rollout KV cache; `aggressive_empty_cache(force_sync)`.
+          - 5. `rollout.resume(tags=["kv_cache"])` — wake KV cache so generation
+            can run.
+
+        Lifecycle
+
+          - Called once per PPO outer step, after update_actor and before
+            generate_sequences.
+
+        Called by
+
+          - `RayPPOTrainer.fit` -> actor_rollout_wg.update_weights(step).
+
+        Call graph (THIS ENTITY)
+
+          - disaggregated: -> engine.get_per_tensor_param
+            -> checkpoint_engine.send_weights (awaited).
+          - colocated: -> rollout.resume(weights)
+            -> engine.get_per_tensor_param [+maybe base path]
+            -> rollout.update_weights -> engine.to("cpu")
+            -> aggressive_empty_cache -> rollout.resume(kv_cache).
+
+        Branches
+
+          - `backend != "naive"` -> disaggregated path (phase 0 only).
+          - `self.peft_merge` + `peft_config is None` -> plain single-sync.
+          - `not self.peft_merge` + `peft_config is not None` -> two-phase
+            base+adapter; guarded by `self.base_sync_done`.
+          - `self.config.rollout.free_cache_engine` gates
+            resume(weights) / resume(kv_cache).
+
+        Why
+
+          - The NCCL zero-copy trade-off: colocated path avoids a PCIe / network
+            hop by doing the train-shard -> infer-shard reshape in-GPU, at the
+            cost of blocking the rollout during the window. The async
+            disaggregated path frees the trainer to continue, at the cost of
+            shipping the weights over the fabric. `update_weights` is the one
+            RPC where this trade-off is concretely materialized.
         """
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
@@ -727,12 +1663,48 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
-        """Execute checkpoint engine method.
+        """Generic non-blocking DP_COMPUTE RPC that forwards a method call onto self.checkpoint_engine.
 
-        Args:
-            method (str): Checkpoint engine method name.
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
+        What
 
+          - Dynamic dispatcher: look up `method` on `self.checkpoint_engine`
+            (a CheckpointEngine plugin instance) and invoke it with the given
+            args/kwargs. Lets the trainer call backend-specific APIs (e.g.
+            `wait_for_send`, `broadcast_bucket`, `pull_weights`) without this
+            class having to enumerate them.
+          - `dispatch_mode=Dispatch.DP_COMPUTE, blocking=False` — non-blocking
+            so the trainer can overlap an async weight push with other PPO
+            work; DP_COMPUTE (not DP_COMPUTE_PROTO) because the args/kwargs
+            are not a TensorDict payload.
+
+        Lifecycle
+
+          - Used only on the async/disaggregated rollout path where
+            `checkpoint_engine.backend != "naive"`. On the colocated path,
+            update_weights goes directly to `rollout.update_weights` and this
+            method is not needed.
+
+        Called by
+
+          - `RayPPOTrainer.fit` on the async rollout branch, typically to
+            signal / poll / flush the CheckpointEngine (e.g. wait for the
+            pending `send_weights` to complete before the next step).
+
+        Call graph (THIS ENTITY)
+
+          - trainer -> actor_rollout_wg.execute_checkpoint_engine(method, ...)
+            -> DP_COMPUTE (non-blocking) -> THIS METHOD
+            -> getattr(self.checkpoint_engine, method)(...).
+
+        Branches
+
+          - None in this method; all branching lives inside the resolved
+            CheckpointEngine subclass.
+
+        Why
+
+          - Keeps the CheckpointEngine plugin surface open-ended: new backends
+            (RDMA, disaggregated Ray actor, blob store) can add methods
+            without editing this class or adding new @register entries.
         """
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)

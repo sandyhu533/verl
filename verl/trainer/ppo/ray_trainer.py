@@ -73,6 +73,17 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+# What: Compute token-level KL(pi_old || pi_ref) over response_mask, subtract beta*KL from
+# token_level_scores to produce token_level_rewards; tick the AdaptiveKLController; return
+# (data, {reward_kl_penalty, coeff}).
+# Lifecycle: driver-CPU step, runs between reward scoring and compute_advantage inside fit().
+# Called by: fit() in verl/trainer/ppo/ray_trainer.py (the KL-in-reward branch).
+# Branches:
+#   - kl_penalty flag selects kl/abs/mse/low_var_kl estimator inside core_algos.kl_penalty
+#   - kl_ctrl may be fixed or adaptive (Hugging Face TRL adaptive schedule)
+# Why: TRL-style KL-in-reward path (mutually exclusive with actor-side use_kl_loss); GRPO
+# canonically prefers KL-in-loss (Shao et al. GRPO), so this branch typically runs for
+# classic PPO/REINFORCE++ where the penalty lives in the reward signal.
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -133,6 +144,19 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+# What: Dispatch on AdvantageEstimator enum and call the matching core_algos estimator
+# (GAE / GRPO / GDPO / REINFORCE++ / RLOO / RF_BASELINE / OPO / GPG); writes advantages and
+# returns back into data.batch and returns the mutated DataProto.
+# Lifecycle: driver-CPU step immediately after apply_kl_penalty (or raw reward) and before
+# _balance_batch + _update_actor/_update_critic inside fit().
+# Called by: fit() in verl/trainer/ppo/ray_trainer.py (the single call site in this module).
+# Branches:
+#   - GAE → needs values from critic; uses gamma/lam bootstrap
+#   - GRPO / RLOO / GDPO → group-normalized baselines keyed by uid, no critic required
+#   - REINFORCE++ / RF_BASELINE / OPO / GPG → per-sample Monte-Carlo baselines
+# Why: Driver-side dispatch lets group-normalized estimators (GRPO) see all samples across
+# workers at once; cost is driver CPU becomes the bottleneck at >10k tokens/step — an open
+# candidate for worker-side offload.
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -231,6 +255,20 @@ def compute_advantage(
     return data
 
 
+# What: Orchestrator sitting on the Ray driver. Holds role->RayWorkerGroup handles
+# (actor_rollout_wg, critic_wg, ref_policy_wg, rm_wg), data loaders, KL controller,
+# checkpoint mgr, and exposes init_workers() + fit() as the public surface.
+# Lifecycle: constructed once by the TaskRunner (main_ppo.py); init_workers() spawns Ray
+# actors on the ResourcePool; fit() then drives the RL loop until total_training_steps.
+# Called by: TaskRunner.run in verl/trainer/main_ppo.py (canonical entry); subclassed by
+# RobRayPPOTrainer (experimental/vla) and SeparateRayPPOTrainer (experimental/separation).
+# Branches:
+#   - role_worker_mapping gates which WorkerGroups exist (critic only if use_critic, etc.)
+#   - hybrid_engine co-locates actor+rollout on one group vs separate rollout_wg
+#   - ref_in_actor toggles LoRA-style detached ref vs dedicated RefPolicy worker
+# Why: Synchronous single-controller — determinism/simplicity vs pipeline bubbles between
+# roles (rollout, ref, critic, actor each serialize on the driver); see HybridFlow §4
+# single-controller design.
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -1054,6 +1092,21 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
+    # What: Compute per-sample token workload from attention_mask, partition indices across
+    # dp_size ranks via get_seqlen_balanced_partitions (or group-aware variant), then
+    # batch.reorder(global_idx) in place; also emits seqlen-unbalance metrics.
+    # Lifecycle: driver-side, runs once per step after compute_advantage and before
+    # _update_actor / _update_critic dispatch.
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py.
+    # Branches:
+    #   - use_prefix_grouper+uid → get_group_balanced_partitions keeps same-uid on one rank
+    #     (prefix-cache locality); requires num_uid_groups % dp_size == 0
+    #   - keep_minibatch → balance within each ppo_mini_batch slice so DP balance doesn't
+    #     leak across minibatch boundaries
+    #   - default → global seqlen-balanced karmarkar-karp partition with "zig-zag" reorder
+    #     (small-large pairing) to shrink pipeline-parallel bubbles
+    # Why: HybridFlow §5 structural DP load balancing — straggler DP rank dominates step
+    # latency, so token-workload equalization is the cheapest win before any comm overlap.
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
@@ -1124,6 +1177,18 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    # What: Dispatch batch to critic_wg.compute_values (or infer_batch in the new-worker
+    # path), block on the returned DataProto, and surface a {"values": float tensor}
+    # DataProto aligned to response tokens.
+    # Lifecycle: driver step, runs alongside _compute_ref_log_prob after old_logprob and
+    # before apply_kl_penalty/compute_advantage inside fit().
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py (guarded by self.use_critic).
+    # Branches:
+    #   - use_legacy_worker_impl == "disable" → tensordict path with left/right→no-padding
+    #     conversion, uses infer_batch async handle + .get()
+    #   - legacy path → direct critic_wg.compute_values(batch) RPC
+    # Why: Blocking RPC to the critic worker group; only needed on the GAE path — GRPO/RLOO
+    # skip this entirely because group-relative baselines remove the value head.
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1138,6 +1203,18 @@ class RayPPOTrainer:
         values = DataProto.from_tensordict(values)
         return values
 
+    # What: Produce ref_log_prob tensor under the frozen reference policy; returns a
+    # DataProto with {"ref_log_prob": float(B, resp_len)} for the KL term.
+    # Lifecycle: driver step, runs after _compute_old_log_prob and before
+    # apply_kl_penalty/actor update inside fit(); skipped when no KL term is active.
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py (when use_reference_policy).
+    # Branches:
+    #   - ref_in_actor=True → actor_rollout_wg.compute_log_prob with no_lora_adapter=True
+    #     (base model seen through the actor worker with adapter detached — saves a GPU copy)
+    #   - ref_in_actor=False → dedicated ref_policy_wg.compute_ref_log_prob RPC
+    #   - legacy worker impl vs tensordict+no-padding path
+    # Why: Two-path ref policy hides the LoRA vs separate-worker split from the caller;
+    # ref_in_actor is the memory-saving default for LoRA fine-tuning.
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
@@ -1162,6 +1239,19 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
+    # What: RPC to actor_rollout_wg.compute_log_prob with calculate_entropy=True; returns
+    # (DataProto{old_log_probs, entropys, [routed_experts]}, mfu) used as pi_old and the
+    # entropy-bonus signal in the upcoming PPO epochs.
+    # Lifecycle: first driver RPC after rollout+reward, before ref/value forward passes
+    # inside fit(); result is frozen for all ppo_epochs mini-batch iterations.
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py.
+    # Branches:
+    #   - use_legacy_worker_impl == "disable" → tensordict no-padding path, may also pull
+    #     routed_experts for MoE load-balance loss
+    #   - legacy path → direct compute_log_prob, mfu set to 0
+    # Why: Recompute anchors pi_old under the training engine so the PPO ratio is immune to
+    # rollout-engine numerical drift (vLLM/SGLang fp16 vs FSDP bf16), which otherwise biases
+    # the importance-sampling correction.
     def _compute_old_log_prob(self, batch: DataProto):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
@@ -1199,6 +1289,18 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    # What: Stamp multi_turn/temperature onto meta_info, then RPC actor_rollout_wg.update_actor
+    # (ppo_epochs * batch/ppo_mini_batch_size grad steps internally); return actor metrics
+    # wrapped as a DataProto under the "actor/" prefix.
+    # Lifecycle: last compute-heavy driver step in fit(), after critic update and balance;
+    # followed only by weight sync to the rollout engine.
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py (gated by critic_warmup counter).
+    # Branches:
+    #   - use_legacy_worker_impl == "disable" → tensordict path carrying epochs, mini_batch,
+    #     calculate_entropy, distillation_use_topk, shuffle/seed
+    #   - legacy path → direct actor_rollout_wg.update_actor(batch)
+    # Why: This blocking RPC plus rollout generation dominate step latency; ppo_epochs > 1
+    # reuses the frozen old_log_probs from _compute_old_log_prob per the PPO objective.
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1241,6 +1343,18 @@ class RayPPOTrainer:
 
         return actor_output
 
+    # What: RPC critic_wg.train_mini_batch (or update_critic in legacy path) to regress
+    # values toward returns; return critic metrics under the "critic/" prefix.
+    # Lifecycle: driver step immediately before _update_actor in fit(); the only critic
+    # gradient update of the iteration.
+    # Called by: fit() in verl/trainer/ppo/ray_trainer.py (guarded by use_critic).
+    # Branches:
+    #   - use_legacy_worker_impl == "disable" → tensordict+no-padding, critic-side ppo
+    #     epochs/mini-batch pulled from config.critic
+    #   - legacy path → direct critic_wg.update_critic(batch)
+    # Why: During the first `critic_warmup` iterations fit() calls this while skipping
+    # _update_actor, stabilizing the value head (and thus GAE targets) before the policy
+    # starts moving — avoids early PPO variance blow-up.
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
@@ -1268,6 +1382,37 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
+    # What: The outer training loop. Iterates train_dataloader, runs generate_sequences on
+    # actor_rollout_wg, scores with reward_fn (and optional rm_wg), computes old/ref
+    # log-probs + values, applies KL-in-reward, computes advantages, balances the batch,
+    # updates critic then actor, syncs weights back to rollout, logs metrics, and
+    # periodically validates / checkpoints until total_training_steps.
+    # Lifecycle: single long-running call; the canonical PPO event loop on the driver.
+    # Called by: TaskRunner.run in verl/trainer/main_ppo.py (also wrapped by the experimental
+    # separation / VLA trainers that subclass this).
+    # Branches:
+    #   - use_critic / critic_warmup → include _compute_values + _update_critic, optionally
+    #     skip _update_actor during warmup
+    #   - algorithm.use_kl_in_reward → apply_kl_penalty before compute_advantage; else the
+    #     KL term lives inside the actor loss (GRPO-style use_kl_loss)
+    #   - async_rollout / rollout_skip → diverge in how generate_sequences is driven
+    #   - val_before_train / test_freq / save_freq → validation and checkpoint side-steps
+    # Why: Synchronous driver-side loop keeps role ordering deterministic and makes
+    # correctness debugging tractable; cost is pipeline bubbles between roles. See
+    # HybridFlow §4 for the single-controller rationale.
+    #
+    """=== InstructGPT paper mapping (Ouyang et al. 2022, §3) ===
+    Stage 1 (SFT) — DONE OFFLINE before this trainer runs. Produces the init checkpoint
+      loaded by _load_checkpoint() and the frozen π^SFT used as π_ref below.
+    Stage 2 (RM training) — DONE OFFLINE. Produces the reward model loaded into rm_wg
+      (or replaced by a rule-based verifier for GSM8K / math / code — see Reward Manager).
+    Stage 3 (RL fine-tuning) — THIS METHOD. Each training step executes Stages 1..8 below,
+      implementing the InstructGPT §3.3 PPO objective:
+        objective(φ) = E[r_θ(x,y) - β·log(π_φ^RL(y|x) / π^SFT(y|x))]
+                     + γ·E[log π_φ^RL(x)]          (pretrain mix — not used here)
+    The sub-stages annotated inline below are the standard PPO event order; veRL's GRPO
+    path skips Stage 5b (value forward) and Stage 7a (critic update) since there's no critic.
+    """
     def fit(self):
         """
         The training loop of PPO.
@@ -1289,6 +1434,10 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
+        # Resume-then-push: _load_checkpoint() restores actor/critic/optim/dataloader state
+        # onto the FSDP trainer shards; update_weights() immediately pushes those weights
+        # into the rollout replicas via NCCL so π_rollout == π_θ at step 0. Without this
+        # second call a resumed run would rollout with random vLLM weights until first sync.
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -1296,6 +1445,10 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        # Baseline step-0 metric: pins down "what zero-shot / SFT-initial reward looks
+        # like on the val set" before any RL gradient has moved the policy. Without it
+        # you can't tell whether a flat learning curve is "already converged" or "broken".
+        # val_only=True short-circuits here for eval-only runs (e.g. comparing checkpoints).
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -1325,6 +1478,10 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            """Stage 1 — Sample a mini-batch of prompts x ~ D_{π^RL} (InstructGPT §3.3).
+            The RL prompt distribution is the same dataset as Stages 1/2; here we only
+            draw x (prompts). Responses y come from Stage 2 rollout, not the dataset.
+            """
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1341,25 +1498,45 @@ class RayPPOTrainer:
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
+                # uid = group key for GRPO/RLOO group-normalized advantage. Each prompt gets
+                # one uid; after the .repeat(n) below, n rollouts of the same prompt share
+                # a uid, and compute_grpo_outcome_advantage groups by it to subtract the
+                # group mean/std. For non-GRPO algorithms uid is still carried (used by
+                # PrefixGrouper in _balance_batch for prefix-cache locality).
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # _get_gen_batch drops training-only fields (labels, ref_log_prob slots, ...)
+                # and keeps only what rollout needs (input_ids, attention_mask, raw_prompt_ids,
+                # multi_modal_inputs). Smaller payload → cheaper scatter to rollout workers.
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # Expand 1 prompt → rollout.n independent generation requests. interleave=True
+                # keeps same-uid rollouts contiguous in the batch so group ops like
+                # rewards.view(B, n).mean(-1) work without a reorder. See DataProto.repeat
+                # docstring for why the trainer does this instead of using vLLM's native `n=`.
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    """Stage 2 — Rollout: sample y ~ π_φ^RL(·|x) (InstructGPT §3.3).
+                    vLLM/SGLang runs the *current* actor weights; this y is the on-policy
+                    trajectory scored in Stage 3 and graded against π_old/π^SFT in Stage 7b.
+                    """
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        # HybridEngine wake/sleep: vLLM was woken inside generate_sequences
+                        # (ShardingManager.__enter__ gathered FSDP shards into full rollout
+                        # weights + KV cache). sleep_replicas() tears down the KV cache and
+                        # frees GPU memory so the subsequent FSDP training forward/backward
+                        # can use the full 40% rollout-budget. Without this, OOM on log_prob.
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
@@ -1367,6 +1544,10 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # REMAX (Li et al. 2023): use a *greedy* rollout of the same prompt as a
+                    # reward baseline — advantage = r_sample - r_greedy. Cheaper than a critic
+                    # (no value-net backward) but needs a second rollout pass per batch with
+                    # do_sample=False. Other estimators (GAE/GRPO/RLOO) skip this branch.
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1396,9 +1577,17 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
+                    # gen_batch_output already has batch_size = B*n (expanded before rollout).
+                    # The training-side batch (labels, uid, ground_truth, ...) is still B,
+                    # so we expand it with the SAME interleave=True to keep uid-grouping
+                    # consistent, then union merges the two into a single (B*n)-wide DataProto.
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # response_mask = 1 on generated tokens, 0 on prompt/padding. Used by every
+                    # downstream driver-side op (advantage, KL, entropy, metrics) to ignore
+                    # prompt tokens — otherwise GRPO std collapses and GAE backward scan bleeds
+                    # reward into prompt positions. Set by rollout engine when available.
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1417,6 +1606,10 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    """Stage 3 — Reward: compute r_θ(x,y) (InstructGPT §3.3, eq (2) term 1).
+                    Original InstructGPT uses the Stage-2 RM from §3.1; veRL also accepts
+                    rule-based / verifiable rewards (GSM8K, math, code) in place of r_θ.
+                    """
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1441,6 +1634,14 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
+                        """Stage 4 — Recompute π_old log-probs under the FSDP actor kernel.
+                        NOT in the original InstructGPT write-up (they took log π_old directly
+                        from the sampling forward pass). This pass exists because the vLLM/SGLang
+                        rollout kernel and the FSDP training kernel disagree at ~1e-3 per token
+                        (bf16/fp8 vs bf16, different attention impl). Using rollout log-probs as
+                        π_old would give a biased PPO ratio; this recompute re-anchors π_old to
+                        the trainer kernel so the clip objective matches classical PPO exactly.
+                        """
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
@@ -1458,6 +1659,10 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
+                            # MoE router-replay conflict guard: R2 mode records router decisions
+                            # during rollout and replays them in training forward; R3 mode re-runs
+                            # the router on current weights. If both flags set, we'd have two
+                            # competing routed_experts tensors and silently wrong grads for experts.
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1467,6 +1672,10 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            # rollout_log_probs = logp under π_rollout (vLLM forward), old_log_probs
+                            # = logp under π_θ just-now (FSDP forward). Their divergence is a
+                            # staleness signal: large rollout↔old drift means HybridEngine weight
+                            # sync is lagging, or the rollout engine has numeric drift (fp16 vs bf16).
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
@@ -1475,18 +1684,32 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    """Stage 5a — Reference forward: log π^SFT(y|x) for the KL penalty term
+                    β·log(π_φ^RL / π^SFT) in InstructGPT §3.3 eq (2). Skipped when the algorithm
+                    doesn't need a KL anchor (some GRPO variants, SimPO-style, pure reward max).
+                    """
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    """Stage 5b — Value forward: V_ψ(x, y_{<t}) for GAE. From the PPO paper
+                    (Schulman 2017), not the original InstructGPT algorithm statement. Skipped
+                    by critic-free algorithms (GRPO, RLOO, REINFORCE++) that use group-relative
+                    or MC baselines instead of a learned value function.
+                    """
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    """Stage 6 — Fold KL into reward, then compute advantages. InstructGPT §3.3
+                    treats β·log(π_φ^RL/π^SFT) as a per-token penalty ADDED to r_θ before the
+                    value/advantage computation (kl_in_reward path). Modern variants (GRPO, ...)
+                    sometimes move KL into the policy loss instead (kl_in_loss). Advantage itself
+                    is GAE (PPO paper) for critic algos, or group-normalized r for GRPO.
+                    """
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1496,6 +1719,10 @@ class RayPPOTrainer:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
+                        # Mutually exclusive with actor.use_kl_loss (asserted at init). Here
+                        # we bake the KL into token_level_rewards via an adaptive β, so GAE/GRPO
+                        # sees a single scalar reward stream. else-branch just aliases scores →
+                        # rewards (KL will be applied inside PPO loss, GRPO's k3 path).
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1534,7 +1761,13 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                    # update critic
+                    """Stage 7 — Optimizer updates. InstructGPT §3.3 PPO objective split in two:
+                      7a (below) — critic update: V_ψ regression to returns (PPO paper eq (9)).
+                                   Skipped by critic-free algos.
+                      7b (below, after critic_warmup gate) — actor update: clipped surrogate
+                                   E[min(r·A, clip(r,1±ε)·A)] - β·KL (InstructGPT eq (2),
+                                   PPO paper eq (7)). Driven by actor_config.policy_loss_fn_name.
+                    """
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
@@ -1542,6 +1775,11 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    # Why warmup: an untrained critic emits ~random values, so early GAE
+                    # advantages are noisy and can push the actor into a bad region before
+                    # the critic stabilizes. During warmup we do critic SGD only; the actor
+                    # stays frozen, but we STILL push weights so rollout workers don't stall
+                    # waiting for a weight update (HybridEngine expects per-step sync).
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
@@ -1572,7 +1810,14 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
-                        # update weights from trainer to rollout
+                        """Stage 8 — Weight sync trainer → rollout replicas (broadcast/NCCL).
+                        Not in the original InstructGPT algorithm (single-process PPO); it's
+                        the HybridFlow/HybridEngine §5 contribution: Stage 2's vLLM/SGLang engine
+                        must see the freshly-updated φ before the next rollout, or the next PPO
+                        ratio π_new/π_old is biased by one step. Runs every training step in the
+                        synchronous path; the fully-async path batches syncs every
+                        trigger_parameter_sync_step to amortize NCCL cost.
+                        """
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -1585,6 +1830,10 @@ class RayPPOTrainer:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
+                # Runs AFTER update_actor + update_weights for this step, so _validate()
+                # sees the freshest π_θ via the rollout engine. is_last_step forces a final
+                # eval even if total_training_steps isn't a multiple of test_freq. Validation
+                # uses the same rollout path as training — no separate eval engine.
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):

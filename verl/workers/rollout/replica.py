@@ -66,6 +66,32 @@ class DiffusionOutput(BaseModel):
     """Extra fields for dynamic addition."""
 
 
+# Deployment topology axis for a rollout replica — this is HybridFlow §4's
+# "colocation degree" choice surfaced as an explicit mode. The three modes
+# trade off GPU memory efficiency, weight-sync cost, and scheduling freedom:
+#
+#   HYBRID     — rollout engine and train engine (FSDP/Megatron) live in the
+#                SAME process on the SAME GPUs. Context switch via sleep()/
+#                wake_up(): vLLM/SGLang release KV cache + weights, train step
+#                reclaims the memory, then rollout re-allocates. Weights are
+#                transferred in-process (no RPC). Best GPU utilization, most
+#                restrictive (rollout TP must match train TP topology).
+#                Classic on-policy PPO/GRPO setup from HybridFlow §4
+#                "3D-HybridEngine".
+#
+#   COLOCATED  — rollout and train are separate processes on the SAME Ray
+#                placement group (same physical GPUs). No shared address
+#                space, so weight sync goes over IPC/NCCL. GPU is shared but
+#                each side owns its own CUDA context. Used when the rollout
+#                engine is an auxiliary model (e.g. reward model / LLM-as-a-
+#                judge / teacher) that doesn't need in-place weight swap.
+#
+#   STANDALONE — rollout has its OWN resource pool on separate GPUs,
+#                disaggregated from training (Splitwise-style PD split at
+#                the system level). Rollout runs async, overlaps with train,
+#                supports off-policy / continuous-batching pipelines.
+#                Highest parallelism, highest GPU cost, weight sync is a
+#                cross-node NCCL broadcast.
 class RolloutMode(Enum):
     # Rollout engine and training engine(fsdp/megatron) fused in same process
     # Rollout and trainer share GPUs, switch context with weight synchronization.
@@ -103,6 +129,44 @@ class RolloutReplica(ABC):
         config: RolloutConfig, full config.
         model_config: DictConfig, model config.
         gpus_per_node: int, number of gpus per node.
+
+    What:
+      - Abstraction over one rollout *server instance* (may span multiple nodes when
+        world_size > gpus_per_node). Hides the vLLM/SGLang/TRTLLM backend behind a
+        uniform interface: launch_servers / wake_up / sleep / abort / clear_kv_cache.
+      - Subclasses (vLLMReplica, SGLangReplica, TRTLLMReplica, vLLMOmniReplica) live
+        in their respective backend modules and only implement launch_servers() plus
+        engine-specific init args.
+
+    Lifecycle:
+      - Constructed once per replica by the trainer / agent loop.
+      - Exactly one of init_hybrid / init_hybrid_colocated / init_colocated /
+        init_standalone is awaited to pick the deployment topology.
+      - Each init path terminates in launch_servers() which brings up the HTTP/RPC
+        endpoint and populates self.servers + self._server_address.
+      - During RL training, wake_up/sleep are toggled between rollout and train
+        phases (HYBRID mode); standalone replicas stay awake.
+
+    Branches (the four init paths = three RolloutModes):
+      - init_hybrid             -> HYBRID     (co-process, on-policy)
+      - init_hybrid_colocated   -> HYBRID     (same as above + explicit PG handle,
+                                               used for per-rank server restart)
+      - init_colocated          -> COLOCATED  (separate process, shared PG)
+      - init_standalone         -> STANDALONE (own resource pool, disaggregated)
+
+    Called by:
+      - verl/experimental/agent_loop/agent_loop.py — main PPO rollout manager.
+      - verl/experimental/reward_loop/reward_model.py — reward-model rollout.
+      - verl/experimental/teacher_loop/teacher_model.py — teacher rollout.
+      - verl/trainer/main_generation_server.py — standalone-only generation server.
+
+    Why:
+      - HybridFlow §4 "3D-HybridEngine" argues the colocation-degree decision is
+        the single biggest lever in RLHF infra. This class makes that degree a
+        first-class runtime choice instead of a compile-time fork.
+      - sleep/wake_up follow vLLM SOSP'23 PagedAttention semantics: sleep() frees
+        KV blocks + optionally weights, wake_up() re-allocates. That's what lets
+        HYBRID mode fit a 70B train+rollout on the same GPUs.
     """
 
     def __init__(
@@ -148,6 +212,27 @@ class RolloutReplica(ABC):
 
         Args:
             worker_group: RayWorkerGroup, fused workers where training engine(fsdp/megatron) have been initialized.
+
+        What:
+          - HYBRID mode, reusing an already-initialized fused worker group. No new
+            Ray actors are spawned here — we slice worker_group.workers into the
+            [rank*world_size, (rank+1)*world_size) window that belongs to *this*
+            replica and stash them in self.workers.
+
+        Lifecycle:
+          - Called AFTER the train-side worker_group is up (FSDP/Megatron init
+            already ran inside those same actors). The rollout engine will be
+            launched inside each of those actors by launch_servers().
+
+        Called by:
+          - verl/experimental/agent_loop/agent_loop.py:1119 — default HYBRID path
+            in AgentLoopManager when rollout_mode == "hybrid".
+
+        Why:
+          - This is HybridFlow §4 "3D-HybridEngine": train and rollout share the
+            Python process so weights can be handed off in-memory (no NCCL
+            broadcast). Placement group is implicit — it's whatever pool the
+            fused worker_group already occupies.
         """
         self.rollout_mode = RolloutMode.HYBRID
         self.workers = worker_group.workers[
@@ -162,6 +247,27 @@ class RolloutReplica(ABC):
             worker_group: RayWorkerGroup, fused workers where training engine(fsdp/megatron) have been initialized.
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
             bundle_indices: list[int], bundle indices for this rollout replica.
+
+        What:
+          - Variant of init_hybrid that ALSO remembers the RayResourcePool and the
+            exact bundle indices belonging to this replica. Still rollout_mode =
+            HYBRID — same in-process weight sharing as init_hybrid.
+
+        Branches vs init_hybrid:
+          - init_hybrid: replica only tracks worker actor handles. Sufficient when
+            the engine is never re-launched into the same PG bundles.
+          - init_hybrid_colocated: ALSO tracks (resource_pool, bundle_indices) so
+            backends that launch a sidecar process pinned to specific GPU bundles
+            (currently TRT-LLM) can address those bundles directly.
+
+        Called by:
+          - verl/experimental/agent_loop/agent_loop.py:1124 — TRTLLM branch of
+            AgentLoopManager (see "TODO: unify trtllm to init_hybrid" at L1120).
+
+        Why:
+          - TRTLLM's engine builder needs bundle-level placement info that vLLM /
+            SGLang infer from ray.get_runtime_context(). Carrying the PG through
+            is the minimal-invasive unification point with init_hybrid.
         """
         self.rollout_mode = RolloutMode.HYBRID
         self.workers = worker_group.workers[
@@ -178,6 +284,29 @@ class RolloutReplica(ABC):
 
         Args:
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
+
+        What:
+          - COLOCATED mode. SPAWNS a fresh RayWorkerGroup of CheckpointEngineWorker
+            actors on the *same* Ray placement group as the trainer, but in
+            separate OS processes. Name prefix is branched on is_reward_model /
+            is_teacher_model so multiple colocated replicas can coexist.
+
+        Lifecycle:
+          - Caller must have already created + bound the shared resource_pool via
+            the trainer's ResourcePoolManager. This method adds a second worker
+            group layer on top of it.
+
+        Called by:
+          - verl/experimental/reward_loop/reward_model.py:78 — reward-model path.
+          - verl/experimental/teacher_loop/teacher_model.py:95 — teacher path.
+
+        Why:
+          - For LLM-as-a-judge and teacher models we want the memory efficiency of
+            co-residency (no extra GPUs) WITHOUT the weight-sync machinery of
+            HYBRID — these models typically have frozen weights. Separate process
+            means independent CUDA context and independent backend version.
+          - TODO on L174: author flags this as the eventual default unification
+            target; RolloutMode boundaries still need cleanup.
         """
         self.rollout_mode = RolloutMode.COLOCATED
         self.resource_pool = resource_pool
@@ -202,7 +331,32 @@ class RolloutReplica(ABC):
         await self.launch_servers()
 
     async def init_standalone(self):
-        """Init standalone rollout server, create new resource pool for this rollout."""
+        """Init standalone rollout server, create new resource pool for this rollout.
+
+        What:
+          - STANDALONE mode. CREATES its own RayResourcePool (shape = nnodes x
+            gpus_per_replica_node) via ResourcePoolManager, then spawns a fresh
+            RayWorkerGroup of CheckpointEngineWorker actors inside it. No
+            dependency on any pre-existing train worker_group.
+
+        Lifecycle:
+          - Called on rollout replicas that run disaggregated from training. The
+            resource pool is owned by this replica and lives for the replica's
+            lifetime.
+
+        Called by:
+          - verl/experimental/agent_loop/agent_loop.py:1129 — STANDALONE branch.
+          - verl/trainer/main_generation_server.py:56 — offline generation server.
+          - verl/experimental/reward_loop + teacher_loop standalone branches.
+          - Most unit tests (tests/workers/rollout/**, tests/experimental/**) —
+            standalone is the simplest to bring up in isolation.
+
+        Why:
+          - Disaggregated rollout = Splitwise-style separation at the RL level.
+            Rollout GPUs run continuously (async generation, off-policy data),
+            train GPUs run step loop, weight sync is an explicit NCCL broadcast.
+            Costs more hardware, removes the sleep/wake tax, unlocks async RL.
+        """
         # create resource pool for this rollout
         self.rollout_mode = RolloutMode.STANDALONE
         if self.is_reward_model:
@@ -275,11 +429,28 @@ class RolloutReplica(ABC):
         return True
 
     async def wake_up(self):
-        """Wake up each rollout server."""
+        """Wake up each rollout server.
+
+        What / Why:
+          - Fan-out to every backend server's wake_up() in parallel. Semantics
+            come from vLLM SOSP'23 PagedAttention: wake_up() re-allocates the KV
+            cache block pool (and, in HYBRID mode, reloads weights that sleep()
+            evicted). Called at the START of each rollout phase in HYBRID mode.
+          - No-op / cheap for STANDALONE (engine is always resident).
+        """
         await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
     async def sleep(self):
-        """Sleep each rollout server."""
+        """Sleep each rollout server.
+
+        What / Why:
+          - Inverse of wake_up: frees KV cache blocks and (in HYBRID) releases
+            weight memory so the training engine can reclaim those bytes for
+            optimizer states / activations. Called at the END of each rollout
+            phase in HYBRID mode.
+          - This pair is what makes HybridFlow §4 "3D-HybridEngine" viable — the
+            GPU holds either rollout-state OR train-state, never both.
+        """
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self):

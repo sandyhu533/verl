@@ -46,6 +46,64 @@ def get_random_string(length: int) -> str:
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
+    """What:
+      - Factory returning a callable Functor that wraps one @register-decorated worker
+        method into a scatter-gather pipeline.
+      - Pipeline stages: dispatch(shard) -> execute(remote on all workers) -> collect(gather).
+      - Returns a class-named instance (type(method_name, (Functor,), {})()) so stack
+        traces surface the user-facing method name rather than a generic "Functor".
+
+    Lifecycle:
+      - Invoked once per @register method at WorkerGroup construction time from
+        _bind_worker_method.
+      - Each invocation installs one bound method on self; the returned Functor is
+        reused on every trainer-side call.
+      - Every wg.generate_sequences(...) / wg.update_actor(...) from trainer code
+        enters this Functor.__call__ — it is the hot path of single-controller RPC.
+
+    Called by:
+      - verl/single_controller/base/worker_group.py::WorkerGroup._bind_worker_method
+      - re-entered from RayWorkerGroup.__init__, RayWorkerGroup.spawn_fused, and
+        RayWorkerGroup.fuse (all in this file) whenever methods need (re)binding.
+
+    Call graph:
+      bash/entry_point.sh                                [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                [layer: entry]
+          -> TaskRunner.remote(...)                      [layer: driver actor]
+            -> RayPPOTrainer.init_workers()              [layer: trainer]
+              -> RayWorkerGroup.__init__                 [layer: dispatch]
+                -> _bind_worker_method(cls, func_generator)
+                  -> FUNC_GENERATOR                      [layer: dispatch]
+                    -> Functor.__call__                  [layer: dispatch]
+                      -> dispatch_fn(self, *a, **kw)     [layer: dispatch]
+                        -> execute_fn(method, *a, **kw)  [layer: ray rpc]
+                          -> worker.method.remote(...)   [layer: workers]
+                            -> collect_fn(self, output)  [layer: dispatch]
+
+    Branches:
+      - blocking=True
+          -> ray.get(output) materializes remote refs before collect_fn runs.
+      - blocking=False
+          -> returns raw ObjectRefs; caller is responsible for ray.get later
+            (used for async rollout / overlap paths).
+      - padding_count > 0 and output is DataProto
+          -> trim padded tail via output.select_idxs(indices[:-padding_count]).
+      - padding_count > 0 and output is list
+          -> slice out the padded tail: output = output[:-padding_count].
+      - padding_count == 0
+          -> output returned as-is.
+
+    Why:
+      - This is HybridFlow's single-controller multi-worker abstraction (HybridFlow §3):
+        one driver process issues one Python call, dispatch/collect encode SPMD
+        data-parallel semantics, and user worker code stays vanilla.
+      - Padding trim preserves the user-visible batch size despite DP-divisibility
+        padding inserted by dispatch_fn — a subtle correctness requirement when the
+        batch is not a multiple of world_size.
+      - type(method_name, (Functor,), {})() costs one extra class per method but buys
+        readable stack traces, which matters when debugging rollout/training stalls.
+    """
+
     class Functor:
         def __call__(this, *args, **kwargs):
             args, kwargs = dispatch_fn(self, *args, **kwargs)
@@ -67,7 +125,42 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
 
 
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
-    """
+    """What:
+      - Deterministically order a list of Ray PlacementGroups by the node IP hosting them.
+      - Input: list[PlacementGroup]; output: the same list sorted by NodeManagerAddress.
+      - Guarantees rank_i always lands on the same physical host across job restarts.
+
+    Lifecycle:
+      - Called after placement_group().ready() completes, before any rank is assigned.
+      - Runs once per pool in RayResourcePool.get_placement_groups, and again from
+        _init_with_resource_pool to make the WG's rank<->host mapping reproducible.
+
+    Called by:
+      - RayResourcePool.get_placement_groups (this file).
+      - RayWorkerGroup._init_with_resource_pool (this file).
+
+    Call graph:
+      bash/entry_point.sh                                    [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                    [layer: entry]
+          -> TaskRunner.remote(...)                          [layer: driver actor]
+            -> RayPPOTrainer.init_workers()                  [layer: trainer]
+              -> RayWorkerGroup._init_with_resource_pool     [layer: dispatch]
+                -> SORT_PLACEMENT_GROUP_BY_NODE_IP           [layer: placement]
+                  -> ray.nodes()                             [layer: ray rpc]
+                  -> placement_group_table(pg.id)            [layer: ray rpc]
+
+    Branches:
+      - none (single deterministic code path: read NodeID->IP map, sort by IP).
+
+    Why:
+      - FSDPCheckpointManager shards model/optimizer state to per-rank local storage.
+      - Resume requires rank_i -> host_i to be stable across Ray job restarts;
+        Ray's PG scheduler does not guarantee bundle order by itself.
+      - Folklore pattern for FSDP resume with local-disk sharded checkpoints —
+        no direct paper citation, but widely relied on in production RLHF/SFT stacks.
+      - Assumption: each PG's bundles are all on one node (STRICT_PACK in the caller),
+        so bundles_to_node_id[0] is representative.
+
     Sort the placement groups by node ip, all bundles in a single placement group should be on the same node.
 
     FSDPCheckpointManager saves sharded model states and optimizer states in local storage, which requires RANK
@@ -110,6 +203,63 @@ def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple
 
 
 class RayResourcePool(ResourcePool):
+    """What:
+      - GPU/NPU resource allocation unit.
+      - process_on_nodes=[n0, n1, ...] requests one PlacementGroup per node, each with
+        n_i bundles; one bundle == one worker slot.
+      - Lazy-creates PGs on the first get_placement_groups() call and caches them on
+        self.pgs for reuse by subsequent WorkerGroups.
+
+    Lifecycle:
+      - Built by ResourcePoolManager.create_resource_pool at trainer startup.
+      - Consumed by every RayWorkerGroup that binds to this pool.
+      - Typically one pool per role-family; a single pool is shared by
+        actor/critic/ref/reward roles when colocated (HybridFlow 3D-HybridEngine).
+      - Lives for the full training job (or detached — see branches).
+
+    Called by:
+      - verl/trainer/ppo/ray_trainer.py::ResourcePoolManager.create_resource_pool.
+      - verl/trainer/main_ppo_sync.py and SFT/diffusion trainer scripts that build
+        pools directly.
+      - verl/workers/rollout/replica.py and checkpoint_engine setup paths.
+
+    Call graph:
+      bash/entry_point.sh                                    [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                    [layer: entry]
+          -> TaskRunner.remote(...)                          [layer: driver actor]
+            -> RayPPOTrainer.init_workers()                  [layer: trainer]
+              -> ResourcePoolManager.create_resource_pool    [layer: trainer]
+                -> RAYRESOURCEPOOL(__init__)                 [layer: placement]
+                  -> .get_placement_groups(...)              [layer: placement]
+                    -> ray.util.placement_group(...)         [layer: ray rpc]
+                    -> sort_placement_group_by_node_ip(pgs)  [layer: placement]
+              -> RayWorkerGroup(resource_pool=pool)          [layer: dispatch]
+
+    Branches:
+      - use_gpu=True + device_name="cuda"
+          -> bundle requires 1 GPU.
+      - use_gpu=True + device_name="npu"
+          -> bundle requires 1 NPU (device_name uppercased internally).
+      - accelerator_type set
+          -> bundle additionally requires 1e-4 of that label (soft pin to a GPU SKU).
+      - detached=True
+          -> PGs outlive driver via lifetime="detached"; used for checkpoint_engine
+            and any component that must survive trainer crash.
+      - self.pgs already cached
+          -> early return; get_placement_groups is idempotent.
+
+    Why:
+      - STRICT_PACK forces all bundles of one PG onto one node so TP/PP intra-node
+        NVLink paths are preserved; cross-node TP would collapse rollout throughput.
+      - max_colocate_count CPU slots per bundle gate how many Ray actors
+        (WorkerGroups) can coexist on the same GPU:
+          - 1 for FSDP (single training engine per GPU).
+          - >1 for Megatron where actor/critic/ref can share a device
+            (HybridFlow §4 colocation).
+      - Fractional num_gpus = 1 / max_colocate_count later in RayClassWithInitArgs
+        is the Ray mechanism that actually enforces this sharing on top of the PG.
+    """
+
     def __init__(
         self,
         process_on_nodes: Optional[list[int]] = None,
@@ -161,6 +311,49 @@ class RayResourcePool(ResourcePool):
 
 
 class SubRayResourcePool(RayResourcePool):
+    """What:
+      - A contiguous slice [start_bundle_index, start_bundle_index + subgroup_world_size)
+        of an existing parent pool's PG bundles.
+      - Reuses the parent's PlacementGroups (does not allocate new ones).
+      - Subclass of RayResourcePool; overrides .world_size to report the slice size.
+
+    Lifecycle:
+      - Produced by split_resource_pool when a trainer needs to carve one physical
+        allocation into N disjoint per-role slices.
+      - Consumed by RayWorkerGroup._init_with_subresource_pool, which walks only the
+        slice's bundles when spawning actors.
+      - Multiple SubRayResourcePools can share the same underlying PGs (one slice per role).
+
+    Called by:
+      - split_resource_pool in this file.
+      - Trainers that want separate WorkerGroups over one physical allocation
+        (non-colocated multi-role layouts).
+
+    Call graph:
+      bash/entry_point.sh                                    [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                    [layer: entry]
+          -> TaskRunner.remote(...)                          [layer: driver actor]
+            -> RayPPOTrainer.init_workers()                  [layer: trainer]
+              -> split_resource_pool(pool, split_size)       [layer: placement]
+                -> SUBRAYRESOURCEPOOL(__init__)              [layer: placement]
+              -> RayWorkerGroup(resource_pool=sub_pool)      [layer: dispatch]
+                -> _init_with_subresource_pool(...)          [layer: dispatch]
+                  -> _create_worker(...) per bundle          [layer: ray rpc]
+
+    Branches:
+      - inherits all RayResourcePool branches (use_gpu, device_name, detached, etc.).
+      - world_size property returns subgroup_world_size instead of parent pool's total.
+
+    Why:
+      - Enables multi-role non-colocated layouts without paying Ray's PG creation cost
+        twice or fragmenting the cluster.
+      - Counterpart to FusedWorker colocation:
+          - FusedWorker colocation = one actor hosting N roles on one GPU.
+          - SubRayResourcePool     = N actors slicing one physical allocation across
+            disjoint GPU bundles.
+      - Together they cover the full trade space of HybridFlow §4's role placement.
+    """
+
     def __init__(
         self,
         placement_groups: list[PlacementGroup],
@@ -330,7 +523,60 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
 
 
 class RayClassWithInitArgs(ClassWithInitArgs):
-    """A wrapper class for Ray actors with initialization arguments.
+    """What:
+      - Deferred Ray-actor spec: remembers (cls, args, kwargs, scheduling options) and
+        becomes an actor handle only when __call__(pg, bundle_idx, ...) fires.
+      - One instance is reused once per bundle to spawn the full WorkerGroup.
+      - Carries mutable _options (Ray actor options) and _additional_resource merged
+        in at call time.
+
+    Lifecycle:
+      - Constructed by trainer code before ResourcePool is ready (pure spec, no actor).
+      - Stored on RayWorkerGroup.ray_cls_with_init after WorkerGroup construction.
+      - Invoked from _create_worker per bundle to produce a real Ray actor handle.
+      - Re-used inside spawn_fused and fuse to rebind methods across per-role views.
+
+    Called by:
+      - verl/trainer/ppo/ray_trainer.py (actor/critic/ref/rollout wrapping).
+      - verl/trainer/diffusion/ray_diffusion_trainer.py.
+      - verl/workers/rollout/replica.py.
+      - create_colocated_worker_cls_fused below (re-wraps the fused class in a cia).
+
+    Call graph:
+      bash/entry_point.sh                                    [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                    [layer: entry]
+          -> TaskRunner.remote(...)                          [layer: driver actor]
+            -> RayPPOTrainer.init_workers()                  [layer: trainer]
+              -> RayClassWithInitArgs(cls=ActorWorker, ...)  [layer: dispatch]
+                -> RAYCLASSWITHINITARGS.__call__(pg, idx)    [layer: dispatch]
+                  -> cls.options(**opts).remote(*a, **kw)    [layer: ray rpc]
+                    -> Ray actor materialized on GPU bundle  [layer: workers]
+
+    Branches:
+      - sharing_with provided
+          -> pin new actor to the same node via NodeAffinitySchedulingStrategy(soft=False)
+            and inherit CUDA_VISIBLE_DEVICES from the target actor.
+          -> used for rollout engines colocated on a training worker's GPU.
+      - use_gpu and device_name == "cuda"
+          -> options["num_gpus"] = num_gpus (fractional, 1/max_colocate_count).
+      - use_gpu and device_name == "npu"
+          -> options["resources"] = {"NPU": num_gpus} (Ray has no first-class NPU key).
+      - self._additional_resource has >1 entries
+          -> entries merged directly into options (custom labels, memory reservations).
+      - default
+          -> PlacementGroupSchedulingStrategy pinned to (pg, bundle_idx).
+
+    Why:
+      - Splitting "what to run" from "where to run" lets the trainer compose the full
+        role graph first and defer scheduling-strategy decisions until PG bundles are
+        actually known.
+      - Fractional num_gpus is the Ray mechanism enabling multi-role colocation on a
+        single device (HybridFlow §4 3D-HybridEngine) — without it, Ray would refuse
+        to co-schedule actor+critic+ref on one physical GPU.
+      - sharing_with + NodeAffinity is how verl pins a rollout engine to the same
+        node (and visible devices) as the training worker whose weights it serves.
+
+    A wrapper class for Ray actors with initialization arguments.
 
     This class extends ClassWithInitArgs to provide additional functionality for
     configuring and creating Ray actors with specific resource requirements and
@@ -429,7 +675,72 @@ class RayWorkerGroup(WorkerGroup):
         ray_wait_register_center_timeout: int = 300,
         **kwargs,
     ) -> None:
-        """Initialize a RayWorkerGroup.
+        """What:
+          - Bring up (or attach to) a world_size-sized group of Ray actors from one
+            RayClassWithInitArgs.
+          - Monkey-patch @register-decorated methods onto self so trainer code calls
+            wg.method(...) transparently (via func_generator).
+          - Mutates self._workers, self._worker_names, self._master_addr, self._master_port.
+
+        Lifecycle:
+          - Constructed once per role at trainer init time (or once per fused colocation
+            group).
+          - After __init__ returns, the WorkerGroup is scatter-gather-ready: trainer
+            code can immediately call any @register method.
+          - Workers live for the full training job unless detached or explicitly killed.
+
+        Called by:
+          - verl/trainer/ppo/ray_trainer.py::RayPPOTrainer.init_workers.
+          - verl/trainer/main_ppo_sync.py (sync PPO entry).
+          - verl/workers/checkpoint/checkpoint_engine/base.py (detached checkpoint actors).
+          - verl/workers/rollout/replica.py (init_hybrid_colocated path).
+
+        Call graph:
+          bash/entry_point.sh                                  [layer: launch shell]
+            -> verl/trainer/main_ppo.py::main                  [layer: entry]
+              -> TaskRunner.remote(...)                        [layer: driver actor]
+                -> RayPPOTrainer.init_workers()                [layer: trainer]
+                  -> RAYWORKERGROUP.__INIT__                   [layer: dispatch]
+                    -> resource_pool.get_placement_groups()    [layer: placement]
+                    -> sort_placement_group_by_node_ip(pgs)    [layer: placement]
+                    -> _get_master_addr_port(pg, 0)            [layer: ray rpc]
+                    -> _create_worker(...) per bundle          [layer: ray rpc]
+                      -> ray_cls_with_init(pg, bundle_idx)     [layer: ray rpc]
+                        -> Ray actor on GPU bundle             [layer: workers]
+                    -> _bind_worker_method(cls, func_generator)[layer: dispatch]
+
+        Branches:
+          - worker_names passed and not fused_worker_used
+              -> asserts detached-attach mode, skips PG bundle walk.
+              -> delegates to _init_with_detached_workers (pure reattach).
+          - self._is_init_with_detached_workers
+              -> workers already exist elsewhere; just hold handles.
+          - resource_pool is SubRayResourcePool
+              -> _init_with_subresource_pool (slice layout; bundle indices start at
+                resource_pool.start_bundle_index).
+          - resource_pool is RayResourcePool (plain)
+              -> _init_with_resource_pool: allocate MASTER_ADDR/PORT from pg_idx=0,
+                iterate sort_placement_group_by_node_ip(pgs), _create_worker per local_rank.
+          - ray_cls_with_init is not None
+              -> _bind_worker_method installs dispatch wrappers via func_generator
+                for every @register method on the user class.
+          - profile_steps set and device_name=="cuda"
+              -> runtime_env adds nsight profiler config for each actor.
+
+        Why:
+          - This is the single-controller actor materialization step — the point where
+            the logical role graph turns into physical Ray actors on specific GPUs
+            (HybridFlow §3).
+          - Deterministic ordering via sort_placement_group_by_node_ip makes the
+            rank<->host mapping reproducible across job restarts, which is load-bearing
+            for FSDP checkpoint resume with local-disk sharded state.
+          - The fused_worker_used gate routes into the 3D-HybridEngine colocation path
+            (HybridFlow §4); non-fused path is the classic one-actor-per-role layout.
+          - Method binding happens *after* actor creation so the user class's full
+            MRO (including MegatronWorker / FSDPWorker mixins) is visible for the
+            @register discovery walk.
+
+        Initialize a RayWorkerGroup.
 
         Args:
             resource_pool: Resource pool for worker allocation
@@ -710,7 +1021,55 @@ class RayWorkerGroup(WorkerGroup):
         return worker_group
 
     def spawn(self, prefix_set):
-        """Spawn to a dictionary of worker groups, each with a subset of method with prefix.
+        """What:
+          - Carve one physical WorkerGroup into per-role view WorkerGroups.
+          - Each view exposes only its own prefix's methods (e.g. "actor_update_actor"
+            -> "update_actor" on the "actor" view).
+          - Returns {prefix: RayWorkerGroup}.
+          - No new Ray actors are spawned — actor handles are reused across views.
+
+        Lifecycle:
+          - Called by trainer code after RayWorkerGroup.__init__ to get one handle
+            per logical role when a single colocated actor hosts multiple roles.
+          - Resulting per-role WGs live as long as the underlying actors.
+
+        Called by:
+          - fuse (this class) — fuse delegates to spawn then attrsets the results.
+          - Trainer code that holds a colocated WorkerGroup and wants per-role API
+            surfaces (e.g. wg_dict["actor"].update_actor(...) vs wg_dict["rollout"]).
+
+        Call graph:
+          bash/entry_point.sh                                  [layer: launch shell]
+            -> verl/trainer/main_ppo.py::main                  [layer: entry]
+              -> TaskRunner.remote(...)                        [layer: driver actor]
+                -> RayPPOTrainer.init_workers()                [layer: trainer]
+                  -> wg = RayWorkerGroup(fused cia)            [layer: dispatch]
+                    -> wg.SPAWN({"actor","rollout",...})       [layer: dispatch]
+                      -> self.from_detached(name, handles)     [layer: dispatch]
+                        -> RayWorkerGroup._init_with_detached_workers
+                      -> spawn_fused(prefix_set)               [layer: dispatch]
+                        -> _bind_worker_method(raw_cls_dict[k],
+                                               func_generator) [layer: dispatch]
+
+        Branches:
+          - self.fused_worker_used == True
+              -> delegate to spawn_fused; method calls route through
+                FusedWorker._fuw_execute via the "{cls}_fwmn_{method}" naming key.
+          - self.fused_worker_used == False (legacy create_colocated_worker_cls path)
+              -> _rebind_actor_methods strips the "<role>_" prefix installed by
+                _bind_workers_method_to_parent so wg.update_actor() aliases
+                wg.actor_update_actor().
+
+        Why:
+          - Gives trainer code the illusion of N separate WorkerGroups while
+            physically they share one set of Ray actors.
+          - Key to HybridFlow §4 3D-HybridEngine memory sharing: actor/critic/ref
+            can share one GPU process, amortizing CUDA context, NCCL communicator,
+            and — in the fused path — model weights when shapes match.
+          - Keeping spawn a pure rebinding step (no new actors) means trainer code
+            can build/tear down views cheaply without resource-scheduler round trips.
+
+        Spawn to a dictionary of worker groups, each with a subset of method with prefix.
 
         Args:
             prefix_set: Set of prefixes to create worker groups for
@@ -762,7 +1121,53 @@ class RayWorkerGroup(WorkerGroup):
         return wg_dict
 
     def fuse(self, prefix_set):
-        """Fuse multiple worker groups into the current worker group.
+        """What:
+          - Inverse-perspective of spawn: attach each per-role sub-WorkerGroup as an
+            attribute on self (self.actor, self.critic, ...).
+          - Also bind the top-level FusedWorker methods directly on self so
+            self.method() routes through _fuw_execute.
+          - Populates self.wg_dict (if unset) by internally calling self.spawn first.
+
+        Lifecycle:
+          - Called once after constructing a colocated WorkerGroup when trainer code
+            prefers self.actor.x() / self.critic.x() / self.x() ergonomics over a dict.
+          - Idempotent on self.wg_dict: re-calling fuse does not respawn views.
+
+        Called by:
+          - Trainer orchestration code for 3D-HybridEngine layouts (e.g. PPO ray_trainer
+            when actor/critic/ref share one FusedWorker actor).
+          - Any code path that wants one "super-WG" object with both per-role and
+            top-level method surfaces.
+
+        Call graph:
+          bash/entry_point.sh                                  [layer: launch shell]
+            -> verl/trainer/main_ppo.py::main                  [layer: entry]
+              -> TaskRunner.remote(...)                        [layer: driver actor]
+                -> RayPPOTrainer.init_workers()                [layer: trainer]
+                  -> wg = RayWorkerGroup(fused cia)            [layer: dispatch]
+                    -> wg.FUSE({"actor","critic","ref"})       [layer: dispatch]
+                      -> self.spawn(prefix_set) if needed      [layer: dispatch]
+                        -> self.spawn_fused(...)               [layer: dispatch]
+                      -> setattr(self, role, role_wg) per role [layer: dispatch]
+                      -> _bind_worker_method(cls, func_generator)
+                                                               [layer: dispatch]
+
+        Branches:
+          - self.wg_dict is None
+              -> call self.spawn(prefix_set) first to populate it.
+          - self.wg_dict already set
+              -> skip spawn, only re-bind top-level methods.
+
+        Why:
+          - Symmetric helper to spawn; neither creates new Ray actors.
+          - The combination (per-role attrs + top-level methods) is what makes
+            HybridFlow §4's multi-role-per-actor pattern ergonomic at the trainer
+            call-site: one object, two usage styles.
+          - Binding the top-level FusedWorker methods means cross-role coordination
+            calls (e.g. weight sync between actor and rollout) can be issued without
+            first picking a role view.
+
+        Fuse multiple worker groups into the current worker group.
 
         Args:
             prefix_set: Set of prefixes to fuse into the worker group
@@ -1053,6 +1458,75 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
     class_name_renamed = "_".join([FusedWorkerCLSName] + cls_names)
 
     class FusedWorker(Worker):
+        """What:
+          - One Ray actor hosting N user worker instances (e.g. ActorWorker +
+            CriticWorker + RefWorker) in a single process, sharing the same GPU.
+          - Exposes _fuw_execute to route method calls by "{cls_name}_fwmn_{method_name}"
+            prefix (fwmn = "fused worker method name").
+          - Sub-workers are instantiated locally under DISABLE_WORKER_INIT=1 so
+            __init__ work happens once per actor, not once per role.
+          - Cross-injects fused_worker_dict into every sub-worker so they can see each
+            other (e.g. rollout reading actor weights directly from the same process).
+
+        Lifecycle:
+          - Instantiated inside a Ray actor process when the colocated actor is brought up.
+          - Lives for the full training job (or detached lifetime if configured).
+          - Sub-workers are constructed eagerly in FusedWorker.__init__ (no lazy init).
+
+        Called by:
+          - create_colocated_worker_raw_cls (this file) renames this class to
+            "FusedWorker_Actor_Critic_..." and returns the renamed type.
+          - create_colocated_worker_cls_fused wraps the renamed type in a
+            RayClassWithInitArgs with fused_worker_used=True.
+          - RayWorkerGroup.__init__ then materializes N physical Ray actors from it.
+
+        Call graph:
+          bash/entry_point.sh                                  [layer: launch shell]
+            -> verl/trainer/main_ppo.py::main                  [layer: entry]
+              -> TaskRunner.remote(...)                        [layer: driver actor]
+                -> RayPPOTrainer.init_workers()                [layer: trainer]
+                  -> create_colocated_worker_cls_fused(...)    [layer: dispatch]
+                    -> create_colocated_worker_raw_cls(...)    [layer: dispatch]
+                      -> FUSEDWORKER (class def)               [layer: dispatch]
+                  -> RayWorkerGroup(cia)                       [layer: dispatch]
+                    -> ray_cls_with_init(pg, bundle_idx)       [layer: ray rpc]
+                      -> FusedWorker.__init__ on actor proc    [layer: workers]
+                        -> udc(*args, **kwargs) per sub-role   [layer: workers]
+                        -> setattr(worker, fused_worker_attr_name, dict)
+                                                               [layer: workers]
+                  -> wg.method(...) from trainer               [layer: dispatch]
+                    -> _execute_remote_single_worker           [layer: dispatch]
+                      -> actor._fuw_execute.remote(            [layer: ray rpc]
+                           "{cls}_fwmn_{method}", *a, **kw)
+                        -> FusedWorker._fuw_execute            [layer: workers]
+                          -> self.fused_worker_dict[cls].method(...)
+                                                               [layer: workers]
+
+        Branches:
+          - method call matches self.method_names (set by _bind_worker_method)
+              -> goes through direct remote_call (top-level FusedWorker method).
+          - method call does not match
+              -> routed via _fuw_execute with "{cls_name}_fwmn_{method_name}" key.
+          - sub-worker __init__
+              -> DISABLE_WORKER_INIT=1 shortcut skips distributed init; FusedWorker.
+                __init__ itself handles the actual dist setup once.
+
+        Why:
+          - This is HybridFlow §4's 3D-HybridEngine colocation primitive: actor,
+            rollout, and reference models live in one GPU process so weights/KV cache
+            can share memory and device communicators, without the OS-level overhead
+            of N separate actors.
+          - The "{cls}_fwmn_{method}" naming is the routing key that lets a single
+            Ray actor disambiguate which inner worker should handle a call without
+            needing separate Ray method registrations per role.
+          - fused_worker_dict injection into each sub-worker is what unlocks
+            same-process weight transfer paths (e.g. rollout engine reading actor
+            weights by direct attribute access, bypassing NCCL).
+          - Overriding _get_ray_actor_cls_name / _get_ray_method_prefix on each udc
+            at construction time keeps the @register dispatch logic consistent
+            whether the underlying worker is standalone or fused.
+        """
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.cls_names = cls_names
@@ -1099,7 +1573,59 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
 
 
 def create_colocated_worker_cls_fused(class_dict: dict[str, RayClassWithInitArgs]):
-    """
+    """What:
+      - Public factory. Takes {role_name: RayClassWithInitArgs} and returns one
+        RayClassWithInitArgs whose cls is the fused Ray-remote wrapper.
+      - Sets fused_worker_used=True on the returned cia so RayWorkerGroup enters
+        the FusedWorker code paths (method dispatch via _fuw_execute, spawn/fuse
+        via raw_cls_dict).
+      - Output cia is ready to be consumed by a single RayWorkerGroup.
+
+    Lifecycle:
+      - Trainer calls this during role-graph setup to materialize colocation.
+      - The resulting cia is then passed to a single RayWorkerGroup constructor.
+      - Per-role handles come from .spawn(prefix_set) or .fuse(prefix_set) on that
+        WorkerGroup after construction.
+
+    Called by:
+      - verl/trainer/ppo/ray_trainer.py when the role layout maps multiple roles
+        to the same physical GPU.
+      - Other trainers (sync PPO, diffusion, SFT co-scheduled variants) with
+        colocated layouts.
+
+    Call graph:
+      bash/entry_point.sh                                    [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main                    [layer: entry]
+          -> TaskRunner.remote(...)                          [layer: driver actor]
+            -> RayPPOTrainer.init_workers()                  [layer: trainer]
+              -> CREATE_COLOCATED_WORKER_CLS_FUSED(          [layer: dispatch]
+                   {"actor": cia_a, "critic": cia_c, ...})
+                -> create_colocated_worker_raw_cls(...)      [layer: dispatch]
+                  -> FusedWorker class def                   [layer: dispatch]
+                -> ray.remote(raw_cls)                       [layer: ray rpc]
+                -> RayClassWithInitArgs(cls=remote_cls)      [layer: dispatch]
+                  -> cia.fused_worker_used = True
+              -> RayWorkerGroup(resource_pool, cia)          [layer: dispatch]
+                -> FusedWorker actor per GPU bundle          [layer: workers]
+
+    Branches:
+      - none at this function level (single pipeline: raw_cls -> ray.remote -> cia).
+      - downstream branching happens in RayWorkerGroup/FusedWorker based on
+        fused_worker_used=True.
+
+    Why:
+      - Preferred replacement for the deprecated create_colocated_worker_cls.
+      - Keeps one Ray actor per GPU bundle (1:1 actor:GPU) while still giving the
+        trainer N independent role APIs — the trade-off is slightly more complex
+        method routing (the _fwmn_ naming convention) in exchange for single-process
+        memory sharing.
+      - Single-process memory sharing is what makes HybridFlow §4 3D-HybridEngine
+        practical on commodity GPUs: without it, actor+rollout+ref on one 80GB GPU
+        would duplicate parameters and CUDA contexts N times and OOM.
+      - Returning a RayClassWithInitArgs (rather than a raw class) keeps the call
+        site symmetric with non-colocated paths: trainer code treats all roles
+        uniformly as cia -> RayWorkerGroup.
+
     This function returns a RayClassWithInitArgs instance of FusedWorker, which is an replacement
     of `create_colocated_worker_cls`. WorkerGroup constructed using this class will be a colocated
     WorkerGroup, which will be referenced as `ColocateWorkerGroup` below.

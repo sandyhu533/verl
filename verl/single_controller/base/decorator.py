@@ -24,11 +24,53 @@ MAGIC_ATTR = "attrs_3141562937"
 
 
 class Dispatch(DynamicEnum):
-    """Enum class defining different dispatch modes for distributed computation.
+    """What:
+          - Enum class defining different dispatch modes for distributed computation.
+          - Each mode represents a specific strategy for distributing data across
+            different ranks in a distributed system.
+          - DynamicEnum of scatter/gather strategies naming how a trainer call fans out to N workers.
+          - Each member is just a tag; the actual dispatch_fn/collect_fn pair lives in DISPATCH_MODE_FN_REGISTRY.
 
-    Each mode represents a specific strategy for distributing data across
-    different ranks in a distributed system. The modes are used to control
-    how data is partitioned and processed across different worker groups.
+    Lifecycle:
+          - Declared at import time with an empty _registry; populated by init_predefined_dispatch_mode() below.
+          - Each @register(dispatch_mode=...) stamps the tag into a worker method's MAGIC_ATTR at class-definition time.
+          - WorkerGroup._bind_worker_method later resolves the tag against the registry to install a driver-side stub.
+
+    Called by:
+          - @register in this file (dispatch_mode kwarg default / explicit overrides).
+          - Worker method decorators in verl/workers/fsdp_workers.py, verl/workers/megatron_workers.py,
+            verl/workers/reward_manager/{naive,prime,dapo,batch}.py.
+          - Experimental agent/reward loops in verl/experimental/agent_loop/, verl/experimental/reward_loop/.
+          - Downstream extensions: checkpoint_engine, tqbridge, separation/engine_workers.
+
+    Call graph:
+      launch.sh [layer: launch shell]
+        -> main_ppo.py [layer: entry]
+           -> TaskRunner (ray_trainer driver actor) [layer: driver actor]
+              -> RayPPOTrainer.fit / init_workers [layer: trainer]
+                 -> worker_group.method(batch)  [layer: dispatch]
+                    -> DISPATCH ENUM TAG (via MAGIC_ATTR on the method)
+                       -> DISPATCH (Dispatch.<MODE>)
+                          -> DISPATCH_MODE_FN_REGISTRY[MODE] -> (dispatch_fn, collect_fn) [layer: dispatch]
+                             -> ray actor .remote() per rank [layer: ray rpc]
+                                -> Worker.method body (fsdp_workers / megatron_workers / reward_manager) [layer: workers]
+
+    Branches (core modes used across workers):
+          - ONE_TO_ALL            -> replicate same arg to every rank (load_model, init_weights, broadcast configs).
+          - ALL_TO_ALL            -> pass args through unchanged; caller has already produced a per-rank tuple/list.
+          - DP_COMPUTE_PROTO      -> THE workhorse: chunk a DataProto across world_size with auto-padding, concat results.
+          - DP_COMPUTE_PROTO_WITH_FUNC -> same split semantics but args[0] is a closure replicated to every rank.
+          - DP_COMPUTE / DP_COMPUTE_METRIC -> pre-chunked list-of-N inputs; collect returns list (metrics) or concat.
+          - RANK_ZERO (via Execute.RANK_ZERO) -> driver-only I/O (ckpt save, logging) — not dispatch but execute-side.
+          - DIRECT_ROLLOUT_METHOD -> escape hatch for vLLM ExternalRayDistributedExecutor; dispatch is forbidden.
+
+    Why:
+          - HybridFlow §3.2 models data-flow as a composition of dispatch modes; the enum gives each composition a name.
+          - Using DynamicEnum (not a fixed enum.Enum) lets downstream packages (checkpoint_engine, tqbridge,
+            experimental/) register new modes without editing this file — the dispatch strategy is pluggable data,
+            not hard-coded control flow.
+          - The tag-vs-function separation is what keeps Worker classes backend-agnostic: the same @register'd method
+            runs under Ray today and could run under a different scheduler tomorrow by swapping the registry entry.
     """
 
     _registry = {}
@@ -89,6 +131,45 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
 
 
 def _split_args_kwargs_data_proto_with_auto_padding(chunks, *args, **kwargs):
+    """What:
+          - Chunk every DataProto arg/kwarg into `chunks` shards after padding length up to a multiple of `chunks`.
+          - Returns (splitted_args, splitted_kwargs); splitted_kwargs carries the padding size under _padding_size_key
+            so the collect side can slice the concatenated output back to the original length.
+
+    Lifecycle:
+          - Dispatch-side helper for DP_COMPUTE_PROTO / DP_COMPUTE_METRIC.
+          - Runs on the driver right before RPCs fan out, inside dispatch_dp_compute_data_proto.
+          - Padding size is computed once from the first DataProto arg and reused for every subsequent arg/kwarg in the call.
+
+    Called by:
+          - dispatch_dp_compute_data_proto (directly).
+          - Transitively DISPATCH_MODE_FN_REGISTRY[DP_COMPUTE_PROTO] / [DP_COMPUTE_METRIC] dispatch_fn.
+
+    Call graph:
+      trainer (ray_trainer.py: RayPPOTrainer.fit) [layer: trainer]
+        -> worker_group.<method>(proto_batch)  [layer: dispatch]
+           -> Functor from func_generator [layer: dispatch]
+              -> dispatch_dp_compute_data_proto(worker_group, *args, **kwargs) [layer: dispatch]
+                 -> _SPLIT_ARGS_KWARGS_DATA_PROTO_WITH_AUTO_PADDING(world_size, *args, **kwargs)
+                    -> DataProto.padding(padding_size=...) + DataProto.chunk(chunks=world_size) per arg
+                       -> ray actor .remote() per rank [layer: ray rpc]
+                          -> Worker.method body receives its shard + _padding_size_key kwarg [layer: workers]
+                             -> collect_dp_compute_data_proto strips padding on the way back [layer: dispatch]
+
+    Branches:
+          - obj is DataProto with padding enabled -> compute padding once from first proto, reuse; pad then chunk.
+          - obj is DataProto with padding disabled / DataProtoFuture -> chunk directly (caller guarantees divisibility).
+          - padding_size resolved > 0 -> inject _padding_size_key into kwargs so the collect side can strip the tail.
+          - Length mismatch between DataProto args -> assert; all padded args in a single call must share length.
+
+    Why:
+          - Without padding, a batch of N %% world_size != 0 leaves the last rank with a short shard, skewing load
+            and breaking allreduce sizes during collective ops inside the worker body.
+          - Padding metadata travels in kwargs instead of a side channel so the collect path
+            (collect_dp_compute_data_proto) can slice the concatenated output back to the original length — HybridFlow §3.2.
+          - Computing padding_size once from the first arg (not per-arg) is what lets multi-arg calls stay aligned across
+            ranks; the nonlocal closure is the cheapest way to implement that without threading state through a class.
+    """
     from verl.protocol import DataProto, DataProtoFuture
 
     data_proto_len = None
@@ -304,7 +385,56 @@ def make_nd_compute_dataproto_dispatch_fn(mesh_name):
     }
 
 
-# Global registry for dispatch mode.
+# What:
+#   - Strategy table mapping Dispatch enum members -> {"dispatch_fn": ..., "collect_fn": ...} pairs.
+#   - The single source of truth that turns a Dispatch tag (on a @register'd method) into actual
+#     scatter (driver -> workers) and gather (workers -> driver) callables.
+#
+# Lifecycle:
+#   - Built at module import after init_predefined_dispatch_mode() and all dispatch/collect helpers are defined.
+#   - Read once per method by WorkerGroup._bind_worker_method via get_predefined_dispatch_fn at WorkerGroup
+#     construction, which happens when the trainer calls RayWorkerGroup(...) during init_workers.
+#   - Mutated at runtime by register_dispatch_mode (add new mode) and update_dispatch_mode (replace pair);
+#     callers include checkpoint_engine/base.py, tqbridge (in verl/utils/transferqueue_utils.py), experimental/.
+#
+# Called by:
+#   - get_predefined_dispatch_fn (this file) -> WorkerGroup._bind_worker_method (worker_group.py L206).
+#   - register_dispatch_mode / update_dispatch_mode (this file) -> external extension code.
+#   - tests/single_controller/base/test_decorator.py snapshots it for fixture isolation.
+#
+# Call graph:
+#   (import time) init_predefined_dispatch_mode() [layer: entry]
+#     -> Dispatch.register("ONE_TO_ALL") ... Dispatch.register("DIRECT_ROLLOUT_METHOD")
+#        -> DISPATCH_MODE_FN_REGISTRY = {...}  (populated here)
+#
+#   (bind time) RayPPOTrainer.init_workers [layer: trainer]
+#     -> RayWorkerGroup.__init__ (verl/single_controller/ray/base.py) [layer: driver actor]
+#        -> self._bind_worker_method(cls, func_generator) [layer: dispatch]
+#           -> get_predefined_dispatch_fn(method.MAGIC_ATTR.dispatch_mode) [layer: dispatch]
+#              -> DISPATCH_MODE_FN_REGISTRY[Dispatch.<MODE>]  (reads THIS ENTITY)
+#                 -> func_generator(dispatch_fn, collect_fn, ...) -> Functor installed on the group
+#                    -> ray actor .remote() per rank at call time [layer: ray rpc]
+#                       -> Worker.method body [layer: workers]
+#
+#   (runtime extension fan-out):
+#     register_dispatch_mode / update_dispatch_mode -> mutates DISPATCH_MODE_FN_REGISTRY in place
+#     checkpoint_engine, tqbridge, experimental/* -> call the above to plug new (dispatch_fn, collect_fn) pairs
+#
+# Branches (pair choices worth noting):
+#   - ONE_TO_ALL pairs with collect_all_to_all (pass-through), because replicate-in rarely needs a reduce-out;
+#     callers that do aggregate use RANK_ZERO's return (Execute.RANK_ZERO) instead.
+#   - DP_COMPUTE_METRIC reuses dispatch_dp_compute_data_proto but pairs with collect_dp_compute (list, no concat),
+#     so metrics stay a per-rank list rather than being concatenated into one DataProto.
+#   - DIRECT_ROLLOUT_METHOD installs dummy_direct_rollout_call on both sides; calling it raises — the mode exists
+#     only so vLLM's ExternalRayDistributedExecutor can own dispatch itself and verl stays out of the way.
+#
+# Why:
+#   - HybridFlow §3.2: data-flow is a composition of dispatch modes. Keeping the (dispatch, collect) pair as
+#     registry data (not a method on Dispatch, not a subclass) means adding a new fan-out pattern never requires
+#     touching worker code or this enum's definition: plug a pair into the registry and @register(dispatch_mode=...)
+#     picks it up at the next WorkerGroup bind.
+#   - Registry indirection is also how verl decouples the trainer from the scheduler backend — a future non-Ray
+#     executor only needs to ship its own func_generator and rely on the same registry contract.
 DISPATCH_MODE_FN_REGISTRY = {
     Dispatch.ONE_TO_ALL: {
         "dispatch_fn": dispatch_one_to_all,
@@ -396,11 +526,65 @@ def _materialize_futures(*args, **kwargs):
 
 
 def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):
-    """Register a function with distributed execution configuration.
+    """What:
+          - Register a function with distributed execution configuration.
+          - Decorator factory that tags a worker method with (dispatch_mode, execute_mode, blocking) attributes.
+          - Wraps the method so any DataProtoFuture args are .get()'d before the user body runs (when materialize_futures).
+          - The tag is stashed on the wrapper under MAGIC_ATTR so the WorkerGroup binding layer can find it by reflection.
+          - Handles both synchronous and asynchronous functions, and optionally materializes futures before execution.
 
-    This decorator registers a function with specific dispatch and execution modes
-    for distributed computation. It handles both synchronous and asynchronous
-    functions, and optionally materializes futures before execution.
+    Lifecycle:
+          - Applied at class-definition time on Worker subclasses: verl/workers/fsdp_workers.py,
+            verl/workers/megatron_workers.py, verl/workers/reward_manager/*, verl/experimental/agent_loop/*,
+            verl/experimental/reward_loop/*, verl/experimental/vla/*, verl/experimental/separation/engine_workers.py.
+          - At WorkerGroup construction, WorkerGroup._bind_worker_method walks the class, reads MAGIC_ATTR, looks up
+            (dispatch_fn, collect_fn) in DISPATCH_MODE_FN_REGISTRY, then calls func_generator to install a driver-side
+            stub (Functor) that implements scatter -> ray .remote() fan-out -> gather.
+          - blocking=False survives into the Functor, which uses it to choose sync vs async dispatch to Ray actors.
+
+    Called by:
+          - All Worker subclass authors across verl/workers/* and verl/experimental/* (dozens of call sites, see grep
+            for @register(). Covers fsdp_workers, megatron_workers, reward managers, agent/reward loops, VLA workers).
+          - utils/profiler/profile.py uses it to wrap profile_trace calls.
+          - MAGIC_ATTR it writes is consumed by WorkerGroup._bind_worker_method (worker_group.py L206) and by
+            RayWorkerGroup in verl/single_controller/ray/base.py (which also re-stamps MAGIC_ATTR onto the outer
+            stub so nested/fused groups can see the same tag).
+
+    Call graph:
+      launch.sh [layer: launch shell]
+        -> main_ppo.py [layer: entry]
+           -> TaskRunner (ray_trainer driver actor) [layer: driver actor]
+              -> RayPPOTrainer.init_workers / RayPPOTrainer.fit [layer: trainer]
+                 -> worker_group.method(batch, ...)  [layer: dispatch]
+                    -> Functor from func_generator (verl/single_controller/ray/base.py:func_generator) [layer: dispatch]
+                       -> dispatch_fn from DISPATCH_MODE_FN_REGISTRY[MAGIC_ATTR.dispatch_mode] [layer: dispatch]
+                          -> ray_actor.method.remote(shard_i) per rank [layer: ray rpc]
+                             -> REGISTER-WRAPPED WORKER METHOD (inner/async_inner from this decorator)
+                                -> _materialize_futures (resolves DataProtoFuture -> DataProto)
+                                   -> user func body (fsdp_workers / megatron_workers / reward_manager) [layer: workers]
+                                -> return value bubbles back through ray.get
+                          -> collect_fn from DISPATCH_MODE_FN_REGISTRY (concat / list / pass-through) [layer: dispatch]
+
+    Branches:
+          - inspect.iscoroutinefunction(func) -> install async_inner (awaits func); lets rollout/agent workers stay async.
+          - materialize_futures=True (default) -> _materialize_futures resolves DataProtoFuture before the body runs,
+            turning the trainer's lazy RPC graph into concrete data at the worker boundary.
+          - materialize_futures=False -> pass futures through unchanged (caller consumes them, e.g. chained pipeline ops).
+          - blocking flag is NOT acted on here -> it rides in MAGIC_ATTR and is honored by the WorkerGroup stub that
+            chooses sync ray.get() vs async ObjectRef return when invoking Ray actors.
+          - tqbridge(dispatch_mode=...) wraps func first -> gives TransferQueue a chance to intercept / re-route data
+            for the modes it understands; transparent when tqbridge is disabled.
+
+    Why:
+          - HybridFlow §3 single-controller/multi-worker: this decorator IS the trainer<->worker boundary. The user
+            writes a normal-looking method on Worker; @register + MAGIC_ATTR + func_generator together synthesize the
+            scatter-gather RPC so trainer code can call worker_group.method(proto) and get a DataProto back without
+            writing dispatch logic by hand.
+          - Decoupling the tag (written here) from the binding (done in WorkerGroup) is what lets the same Worker
+            class run under Ray today and, in principle, under a non-Ray backend tomorrow — only func_generator and
+            the registry entries need to change, never the Worker class.
+          - Materializing futures at the wrapper (not at the call site) keeps user code free of DataProto vs
+            DataProtoFuture branching; the trainer composes ops lazily and only the wrapper forces evaluation.
 
     Args:
         dispatch_mode:

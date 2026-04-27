@@ -98,6 +98,45 @@ class ServerAdapter(BaseRollout):
 
     - hybrid mode: reside in each hybrid worker to sync weights between training engine and SGLang server.
     - standalone/colocated mode: just a dummy placeholder to occupy the GPU to prevent ray scheduling new GPU actor.
+
+    What
+
+      - Sync-friendly BaseRollout façade over the async SGLang HTTP server. Unlike the in-process
+        vLLMRollout, SGLang runs as a separate server process (launched elsewhere as a detached Ray
+        actor named ``sglang_server_{replica}_{node}``); this class is a thin HTTP client that drives
+        that server via ``AsyncHttpServerAdapter``.
+      - Implements the BaseRollout four-method contract (resume / release / update_weights / generate)
+        so trainer-side sharding/rollout orchestration is identical to the vLLM path.
+
+    Lifecycle
+
+      - Constructed once per rollout worker by the FSDP/Megatron workers. The actual HTTP engine
+        handle is created lazily on first use (``_init_server_adapter``) because the SGLang server
+        is launched *after* the hybrid training engine, so we cannot bind a client at __init__ time.
+      - Only ``infer_tp`` local-rank-0 holds a live HTTP client; other TP ranks are no-ops that still
+        need to occupy a GPU slot so Ray does not reschedule another actor onto the same device.
+
+    Call graph
+
+      - resume / release / update_weights delegate to ``AsyncHttpServerAdapter`` -> SGLang server
+        (``/resume_memory_occupation``, ``/release_memory_occupation``, sgl_update_weights).
+      - update_weights piggybacks on SGLang's CUDA-IPC weight-sync (THUDM/slime style), bucketed via
+        ``get_named_tensor_buckets`` to amortize per-bucket IPC handle rebuild cost.
+
+    Why (SGLang vs vLLM)
+
+      - SGLang's win is the RadixAttention prefix cache -> shared prefixes across multi-turn tool
+        loops and structured-program agents are deduplicated; grammar-constrained decoding is native.
+      - Same BaseRollout contract means RL trainers (GRPO/PPO) swap engines by config only.
+      - The out-of-process server model forces the sync/async bridge here: the Ray actor stays sync
+        while the SGLang client is async, hence ``AsyncHttpServerAdapter`` + ``await`` call sites.
+
+    Paper pointer
+
+      - SGLang: Zheng et al. "SGLang: Efficient Execution of Structured Language Model Programs"
+        (radix prefix cache is the multi-turn differentiator).
+      - update_weights path corresponds to HybridFlow §4 3D-HybridEngine weight resharding: training
+        layout -> inference layout -> push to inference engine without extra all-gather on the host.
     """
 
     def __init__(
@@ -107,6 +146,32 @@ class ServerAdapter(BaseRollout):
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
     ):
+        """
+        What
+
+          - Resolve this worker's position within the rollout replica grid and stash config; do NOT
+            connect to the SGLang server yet (lazy in ``_init_server_adapter``).
+
+        Lifecycle
+
+          - Called once per rollout worker during FSDP/Megatron worker startup, before the SGLang
+            HTTP server actor exists.
+
+        Branches
+
+          - fp8 quantization: inject a fixed block-quant config onto ``hf_config`` so SGLang's weight
+            loader materializes an fp8 model rather than bf16. Gated on sglang>=0.5.5.
+          - replica_rank == -1: derive replica from global RANK // rollout_world_size (standard
+            hybrid-engine co-location); otherwise trust an externally assigned replica id.
+
+        Why
+
+          - replica_rank / node_rank / local_rank are recomputed (not reused from env) because the
+            rollout group is a *subset* of the global world (one replica spans TP x DP ranks only),
+            so its internal ordering differs from global RANK.
+          - sleep_level is mutable state touched by engine_workers.update_weights() to switch between
+            LoRA-adapter fast path (sleep_level=1, keep base weights) and full merge (sleep_level=2).
+        """
         super().__init__(config, model_config, device_mesh)
         if self.config.get("quantization", None) == "fp8":
             import sglang
@@ -143,6 +208,30 @@ class ServerAdapter(BaseRollout):
         self.sleep_level = 2
 
     async def _init_server_adapter(self):
+        """
+        What
+
+          - Lazily bind this rank to its SGLang HTTP server (one server per (replica, node)) by
+            looking up the named Ray actor and reading the bound host/port.
+
+        Lifecycle
+
+          - Guarded by idempotent ``self._engine is not None`` check, invoked at the top of every
+            public method (resume/release/update_weights). Runs once per worker.
+
+        Branches
+
+          - device_mesh missing: synthesize a (dp, infer_tp, infer_pp) CPU mesh from torch.distributed
+            world size. Required because weight-sync IPC rebuild uses the ``infer_tp`` sub-mesh.
+          - ``infer_tp`` local-rank != 0: early-return without an HTTP client; only TP rank 0 talks
+            to the server (SGLang server internally fans out to its own TP workers).
+
+        Why
+
+          - Lazy init: the SGLang server actor is launched *after* the hybrid engine because it must
+            inherit CUDA memory after training state is placed. Constructing the HTTP client in
+            __init__ would race the server startup.
+        """
         if self._engine is not None:
             return
 
@@ -182,6 +271,27 @@ class ServerAdapter(BaseRollout):
 
         Args:
             tag: weights or kv_cache.
+
+        What
+
+          - Ask the SGLang server to re-materialize previously released GPU state (weights and/or
+            kv_cache) so the engine is ready to serve generate requests.
+
+        Lifecycle
+
+          - Called by the sharding manager right before a rollout batch, mirroring vLLM's wake_up().
+          - Paired with ``release`` which is called after the rollout batch to hand GPU memory back
+            to the training engine (HybridFlow co-location).
+
+        Branches
+
+          - ``free_cache_engine`` False: skip; memory is never released in this mode so no-op.
+          - Non-tp-rank-0: skip; SGLang server handles internal fan-out.
+
+        Why
+
+          - Tag-selective resume (vs unconditional wake) supports the LoRA fast path where weights
+            stay resident and only kv_cache needs to come back.
         """
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
@@ -193,6 +303,28 @@ class ServerAdapter(BaseRollout):
         When sleep_level=1 (LoRA adapter mode), only releases kv_cache
         to keep base weights alive across training iterations.
         When sleep_level=2 (default/merge mode), releases everything.
+
+        What
+
+          - Hand GPU memory (kv_cache and optionally weights) back to the training engine so the
+            next optimizer step has headroom. SGLang's equivalent of vLLM ``sleep``.
+
+        Lifecycle
+
+          - Invoked by the sharding manager after a rollout batch completes, before training
+            resumes on the co-located GPUs.
+
+        Branches
+
+          - sleep_level == 1: LoRA adapter path, keep base weights resident (saves the reload cost
+            next iteration); release kv_cache only.
+          - sleep_level == 2: full release including weights; next ``resume`` + ``update_weights``
+            will repopulate them.
+
+        Why
+
+          - Matches HybridFlow's co-located memory model: training and rollout time-share the same
+            GPUs, so peak memory per phase is bounded by releasing the other phase's state.
         """
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
@@ -216,6 +348,42 @@ class ServerAdapter(BaseRollout):
           - See reference implementations in SLIME:
             - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
+
+        What
+
+          - Push freshly trained weights from the training engine into the SGLang inference server.
+            Streams named tensors through size-bounded buckets and CUDA IPC so we never materialize
+            the full model twice on the host.
+
+        Lifecycle
+
+          - Called by the sharding manager each training step between optimizer.step() and the next
+            rollout (the "resharding" edge in HybridFlow §4). Follows ``resume(['weights'])`` if the
+            engine was fully asleep.
+
+        Call graph
+
+          - bucket loop -> ``sgl_update_weights`` -> SGLang server (rebuild_cuda_tensor IPC handles
+            on the server side, zero-copy into inference weight slots).
+          - On TP rank 0: ``flush_cache`` (invalidate radix prefix cache entries keyed on old
+            weights) and bump ``global_steps`` on the server actor for telemetry / checkpoint
+            coordination.
+
+        Branches
+
+          - peft_config + base_sync_done: LoRA adapter path. Unload prior adapter if present, then
+            push adapter tensors via ``load_lora_adapter_from_tensor`` (serialize once per infer_tp
+            rank because the server-side multi-proc deserializer expects per-rank payloads).
+          - fp8 quantization: convert bf16 -> fp8 on-the-fly via SGLangFP8QuantizerHelper before
+            bucketing so the server never sees bf16.
+          - Full-weight path: bucket tensors by ``update_weights_bucket_megabytes`` and stream.
+
+        Why
+
+          - Buckets trade one big IPC (OOM risk on server side during rebuild) for many small ones.
+          - LoRA adapter path avoids rebroadcasting the frozen base model each step (major RLHF win).
+          - ``flush_cache`` is required because RadixAttention entries cached under the old weight
+            version would produce stale KVs.
         """
         await self._init_server_adapter()
 
@@ -267,6 +435,24 @@ class ServerAdapter(BaseRollout):
                 await self.server_actor.set_global_steps.remote(global_steps)
 
     def wrap_lora_params(self, peft_config: LoraConfig, weights: Generator[tuple[str, torch.Tensor]]):
+        """
+        What
+
+          - Package a PEFT ``LoraConfig`` + adapter tensors into the (json-dict, serialized-tensors)
+            pair that SGLang's ``LoadLoRAAdapterFromTensorsReqInput`` expects.
+
+        Lifecycle
+
+          - Invoked inside ``update_weights`` on the LoRA branch, once per update step.
+
+        Why
+
+          - Enums (task_type, peft_type) and sets (target_modules) are not JSON-serializable; cast
+            to value / list so the config survives the HTTP boundary.
+          - The serialized tensor payload is replicated ``infer_tp_size`` times because the SGLang
+            server fan-out expects one deserializable blob per inference-TP rank (the
+            MultiprocessingSerializer payload is rank-agnostic, so the same bytes are duplicated).
+        """
         # peft config
         peft_config_json = asdict(peft_config)
         peft_config_json["task_type"] = peft_config_json["task_type"].value

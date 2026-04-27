@@ -83,9 +83,52 @@ device_name = get_device_name()
 
 class FSDPEngine(BaseEngine):
     """
-    Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
+    ZeRO-3 concrete implementation of BaseEngine using PyTorch FSDP / FSDP2.
 
-    Supports model sharding, activation/optimizer offloading, LoRA, and sequence parallelism.
+    What:
+      Shards parameters, gradients, and optimizer state across the DP world
+      (Rajbhandari et al. 2020, ZeRO Stage 3), layered with optional Ulysses
+      sequence parallelism, activation offload, gradient checkpointing, LoRA,
+      and QAT. Subclassed by FSDPEngineWithLMHead (actor/reference/reward) and
+      FSDPEngineWithValueHead (critic) which differ only in output head handling.
+
+    Lifecycle:
+      - __init__ stores configs and builds two device meshes: `device_mesh` for
+        FSDP sharding and `ulysses_device_mesh` (dp x sp) when ulysses_sp > 1.
+      - initialize() -> _build_model_optimizer(): HF AutoModel -> optional LoRA
+        -> optional QAT -> FSDP/FSDP2 wrap -> optimizer + LR scheduler. After
+        init, weights/optimizer/grads are offloaded to CPU if configured.
+      - train_mode()/eval_mode() return EngineTrainModeCtx/EngineEvalModeCtx
+        which on __enter__ reshard params to GPU (load_fsdp_model_to_gpu),
+        set the ulysses SP process group, and flip module.train()/eval();
+        on __exit__ offload back to CPU and restore the previous SP group.
+      - forward_backward_batch -> forward_step -> module(**inputs) under
+        torch.autocast(bf16), with loss.backward() accumulating into sharded grads.
+      - optimizer_step clips grads (FSDP1 clip_grad_norm_ / FSDP2 fsdp2_clip_grad_norm_),
+        skips update if grad_norm is non-finite, returns grad_norm.
+
+    Called by:
+      - verl/workers/fsdp_workers.py (actor / critic / ref / reward workers)
+        construct this via EngineRegistry.new(model_type, "fsdp"|"fsdp2", ...)
+      - DataParallelPPOActor.update_policy / DataParallelPPOCritic.update_critic
+        invoke train_batch (PPO update) and infer_batch (old log-prob / ref log-prob).
+
+    Branches:
+      - strategy="fsdp" vs "fsdp2": FSDP1 uses FullyShardedDataParallel + CPUOffload;
+        FSDP2 uses fully_shard + CPUOffloadPolicy with fine-grained reshard_after_forward.
+      - forward_only=True forces CPUOffload and skips optimizer/LR scheduler build
+        (used for ref / reward policies which never train).
+      - LoRA: wraps with get_peft_model and enables input grads; get_per_tensor_param
+        has merge-vs-unmerge paths for rollout weight sync.
+      - ulysses_sp > 1: builds the 2D dp/sp mesh and activates sequence-parallel
+        input slicing in FSDPEngineWithLMHead.prepare_model_inputs.
+
+    Why:
+      FSDP is the low-friction path for ZeRO-3 on HF models (no model-code edits,
+      unlike Megatron TP/PP). HybridFlow's engine-abstraction lets this coexist
+      with MegatronEngine — users pick based on model size / comm-bandwidth tradeoff.
+      CPUOffload is force-disabled for actor/critic because it interacts badly
+      with gradient accumulation; kept only for ref policy to save memory.
     """
 
     def __init__(
@@ -589,6 +632,83 @@ class FSDPEngine(BaseEngine):
         raise NotImplementedError
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+        """
+        Hot path: run one mini-batch through the model with gradient accumulation.
+
+        What:
+          Splits the incoming mini-batch into micro-batches, runs forward_step on
+          each (with autocast bf16), calls loss.backward() to accumulate grads
+          into FSDP's sharded gradient buffers, collects per-micro-batch metrics,
+          then stitches them back into mini-batch order via indices.
+          Gradients are NOT applied here — optimizer_step() in the caller
+          (train_batch) clips + steps after this returns. This is the standard
+          gradient-accumulation pattern (effectively enlarging per-DP batch size
+          without raising peak activation memory).
+
+        Lifecycle (one call == one PPO/GRPO mini-batch):
+          1. Broadcast sp_size into data so downstream helpers see it.
+          2. All-reduce loss_mask.sum() across the DP group -> batch_num_tokens,
+             used by token-normalized losses so that loss/grad magnitudes stay
+             stable across DP ranks despite sequence-length skew.
+          3. prepare_micro_batches(data, dp_group, same_micro_num_in_dp=True)
+             splits into micro-batches with matched counts per rank (avoids
+             collective deadlock when some ranks would otherwise iterate fewer
+             times than others).
+          4. For each micro-batch:
+             - Under torch.no_grad() if forward_only else nullcontext,
+               call forward_step (autocast bf16 -> HF module -> prepare_model_outputs
+               -> loss_function).
+             - If not forward_only: loss.backward() accumulates into sharded grads.
+             - Append meta_info (loss scalar + metrics) to output_lst.
+          5. postprocess_batch_func reorders metrics back to original sample
+             order and returns per-sample tensors.
+
+        Called by:
+          - BaseEngine.train_batch (forward_only=False): PPO/GRPO actor update,
+            critic update.
+          - BaseEngine.infer_batch (forward_only=True): old-log-prob compute,
+            reference-log-prob compute, reward-model scoring.
+          - Ultimately reached from DataParallelPPOActor.update_policy and
+            DataParallelPPOCritic.update_critic after data is repartitioned.
+
+        Call graph (THIS ENTITY):
+          forward_backward_batch
+            -> prepare_micro_batches              (micro-batch construction)
+            -> forward_step                       (per-micro-batch forward)
+                 -> prepare_model_inputs         (remove_padding / ulysses slice)
+                 -> self.module(**inputs)         (FSDP-wrapped HF forward)
+                 -> prepare_model_outputs        (log_probs / values / entropy)
+                 -> loss_function                 (PPO / GRPO / value loss)
+            -> loss.backward()                    (when not forward_only)
+            -> postprocess_batch_func             (reorder by original indices)
+
+        Branches:
+          - forward_only: skips backward; torch.no_grad context wraps forward_step.
+            Used by ref/reward/old-logprob passes where grads are unnecessary.
+          - use_remove_padding (inside forward_step/prepare_model_inputs): packs
+            variable-length sequences into a single flat (1, total_nnz) tensor
+            for flash_attn_varlen instead of padding — ~2x throughput on skewed
+            batches.
+          - use_ulysses_sp: prepare_model_inputs further slices the packed
+            sequence across the SP group and pads to a multiple of sp_size;
+            prepare_model_outputs runs gather_outputs_and_unpad to reassemble
+            log_probs / entropy / values before loss computation.
+          - enable_activation_offload / gradient_checkpointing: configured at
+            __init__ via enable_activation_offloading (Chen et al. 2016 rematerialization),
+            transparent here — backward() triggers recomputation / D2H activations.
+          - same_micro_num_in_dp=True: pads the micro-batch iteration count so
+            every DP rank issues the same number of all-gather/reduce-scatter
+            collectives (critical for FSDP correctness).
+
+        Why:
+          Gradient accumulation is how verl decouples "algorithmic batch size"
+          (for policy stability) from "hardware micro-batch size" (activation
+          memory). Doing the DP all-reduce on batch_num_tokens once here — not
+          per micro-batch — keeps token-level loss normalization consistent
+          with the paper-style objective while minimizing collectives.
+          Keeping optimizer_step outside this function lets train_mode context
+          managers enforce the "load -> step -> offload" rhythm cleanly.
+        """
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
 
@@ -825,6 +945,41 @@ class FSDPEngine(BaseEngine):
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
+    """Context manager for forward-only (eval) mode on the FSDP engine.
+
+    What:
+
+      - Swaps Ulysses sequence-parallel (SP) group to the engine's SP group and
+        flips the wrapped module into ``eval()`` (disables dropout / eval-time
+        norm behavior).
+      - On exit, restores the previous SP group and forces an FSDP reshard of
+        the root module (FSDP1 ``_handle.reshard(True)`` / FSDP2 ``reshard()``)
+        so parameters return to their sharded layout before the next op.
+
+    Lifecycle:
+
+      - Wraps every forward-only pass: ``compute_log_prob`` and
+        ``compute_ref_log_prob`` on the actor/ref engine.
+      - Entered via ``FSDPEngine.eval_mode()`` each time the worker switches
+        from rollout or training into a log-prob computation.
+
+    Called by:
+
+      - ``ActorRolloutRefWorker`` (role=ref, and role=actor eval pass) through
+        the engine's ``eval_mode()`` factory.
+
+    Why:
+
+      - FSDP does not automatically reshard the root module after an unsharded
+        forward; without an explicit reshard, the next train-mode forward
+        starts from a mismatched param layout.
+      - The SP group must match the device mesh bound to the current compute,
+        otherwise all-gather/reduce-scatter inside attention will deadlock or
+        corrupt shapes.
+      - Mirrors HybridFlow §4 3D-HybridEngine mode switch: eval vs train stages
+        need distinct parallel-group contexts over the same parameters.
+    """
+
     def __init__(self, engine: FSDPEngine, **kwargs):
         super().__init__(engine=engine, mode="eval", **kwargs)
 
@@ -851,6 +1006,44 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
+    """Context manager for train (forward+backward) mode on the FSDP engine.
+
+    What:
+
+      - Inverse of :class:`EngineEvalModeCtx`: installs the engine's Ulysses
+        SP group and flips the wrapped module into ``train()`` (re-enables
+        dropout, grad-producing norm paths).
+      - On exit, restores the previous SP group and calls
+        ``optimizer_zero_grad()`` so the next iteration starts clean.
+
+    Lifecycle:
+
+      - Wraps every ``update_actor`` / ``update_critic`` forward-backward
+        executed inside ``forward_backward_batch``.
+      - Entered via ``FSDPEngine.train_mode()`` when the worker transitions
+        out of rollout or log-prob eval into the optimizer step.
+
+    Called by:
+
+      - Actor / critic training path in ``ActorRolloutRefWorker`` and the
+        critic worker.
+
+    Branches:
+
+      - SP group is always set; optimizer grad-zeroing is deferred to exit so
+        accumulation across micro-batches inside the ``with`` block remains
+        valid.
+
+    Why:
+
+      - Parameters may have been reshaped or resharded during the preceding
+        rollout / eval phase; re-entering train mode re-pins the SP group and
+        restores grad-producing module state before backward.
+      - HybridFlow §4 3D-HybridEngine: training and generation share weights
+        but need different parallel-group + module-mode contexts; this ctx is
+        the train-side half of that toggle.
+    """
+
     def __init__(self, engine: FSDPEngine, **kwargs):
         super().__init__(engine=engine, mode="train", **kwargs)
 

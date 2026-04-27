@@ -29,27 +29,25 @@ milestones can be deferred indefinitely.
 
 ---
 
-## M1 — Data Protocol & Entry Point **[critical]** (~2 h)
+## M1 — Data Protocol & Entry Point **[critical]** (~2.5 h)
 
-**Why first**: `DataProto` is the universal data container. Every worker call,
-every dispatch, every rollout → reward → train hand-off travels as a DataProto.
-Reading this first turns later files into concrete object manipulation rather
-than abstract tensor dict juggling.
+`DataProto` is veRL's universal data container; the `main_ppo.py` entry chain
+is how a shell command becomes a running Ray cluster. Read M1 first — later
+milestones assume you already think in DataProto terms.
 
-**Focus files**:
-- `verl/protocol.py:318–949` — `DataProto` class, `chunk()` (L864), `concat()` (L917), `union()`, `pop()`, serialization
-- `verl/trainer/main_ppo.py:36–462` — Hydra entry, `run_ppo()`, `TaskRunner`, `create_rl_dataset()`
-- `verl/trainer/config/ppo_trainer.yaml` + `verl/trainer/config/algorithm.py` — config surface (skim only)
+Detailed reading plan, function map, and line-by-line annotations: **[M1.md](M1.md)**.
 
-**What to trace**: `DataProto.chunk(n)` → how auto-padding works, how non-tensor
-batches are split, how `meta_info` flows through; then `DataProto.concat(list)`
-→ metric aggregation rules.
+**Notes deliverable**: `01-data-protocol.md` — field taxonomy, chunk/concat/
+union/repeat invariants, written after M1 is done.
 
-**Notes deliverable**: `01-data-protocol.md` — DataProto field taxonomy
-(prompts / responses / rewards / advantages), chunk/concat invariants,
-serialization path.
-
-**Skip**: Hydra/OmegaConf plumbing, `logger` setup, validation dataloader nuances.
+**Acceptance — you've understood M1 when you can:**
+- Explain the three-field model (`batch` / `non_tensor_batch` / `meta_info`) and why veRL didn't just use a single TensorDict or a plain dict.
+- Predict what happens if you call `.chunk(N)` on a DataProto whose batch size isn't divisible by N — and why `auto_padding` exists.
+- Explain why `union()` enforces strict equality on `meta_info` instead of last-write-wins.
+- Trace the path from `python3 -m verl.trainer.main_ppo` to a running Ray cluster (Hydra → `run_ppo` → `TaskRunner` Ray actor → `init_workers` → `fit`).
+- Justify why `TaskRunner` itself is a Ray actor instead of running on the driver.
+- Explain `repeat(interleave=True)` semantics for GRPO and what would break if you used `interleave=False`.
+- (M1.md has the full 8-question self-test.)
 
 ---
 
@@ -84,6 +82,15 @@ understanding it is the gate that unlocks every downstream milestone.
 
 **Skip**: legacy non-Ray dispatch paths, `SubRayResourcePool` edge cases,
 detached-worker reattachment.
+
+**Acceptance — you've understood M2 when you can:**
+- Draw the dispatch/collect flow for `actor_rollout_wg.generate_sequences(batch)`: who chunks, who fans out, who merges, on which process.
+- List at least 4 `Dispatch` modes and explain when each one fires (`DP_COMPUTE_PROTO` vs `ONE_TO_ALL` vs `MEGATRON_COMPUTE_PROTO` vs `DIRECT`).
+- Explain `_bind_worker_method`: how a method decorated with `@register` on `Worker` becomes a callable on `WorkerGroup` with auto-dispatch.
+- Justify placement-group `STRICT_PACK` for actor+rollout colocation — what breaks if you use `SPREAD`.
+- Explain `FusedWorker` string-based dispatch: what problem it solves (multiple roles in one Ray actor for memory sharing) and what's fragile about it.
+- Predict the failure mode when worker `world_size` and DataProto batch size mismatch under `DP_COMPUTE_PROTO`.
+- Articulate why veRL is "single controller, multi worker" (HybridFlow §3) rather than pure SPMD like Megatron — what flexibility this buys at what cost.
 
 ---
 
@@ -120,6 +127,14 @@ comparison table, `AdaptiveKLController` behavior.
 
 **Skip**: REMAX, GRPO_VECTORIZED, OPTIMAL_TOKEN_BASELINE and other variants.
 
+**Acceptance — you've understood M3 when you can:**
+- Recite the `fit()` per-step skeleton (rollout → reward → old_logp → advantage → KL → actor.step → critic.step) without looking, and name which DataProto fields each stage adds.
+- Compare GAE vs GRPO vs RLOO in one sentence each: what baseline they use, why GRPO drops the value head, why RLOO is variance-reduced.
+- Explain `use_kl_loss=True` vs `algorithm.use_kl_in_reward=True` — why they're mutually exclusive and which one GRPO uses.
+- Trace where `old_log_prob` comes from and why it must be computed *before* the actor weight update (importance ratio correctness).
+- Explain `AdaptiveKLController`: what signal it adapts on, what would happen if you fixed `kl_coef` instead.
+- Identify the synchronization barriers in `fit()` — where does the loop block on `ray.get`, and which of those would `main_ppo_sync.py` (M7) eliminate.
+
 ---
 
 ## M4 — Rollout Engine Integration **[critical]** (~5 h)
@@ -149,6 +164,14 @@ RayPPOTrainer.fit()
 
 **Skip**: `trtllm_rollout` (experimental), `hf_rollout` / `naive` rollout (debug-only).
 
+**Acceptance — you've understood M4 when you can:**
+- Explain why veRL uses an HTTP/ZMQ `ServerAdapter` → Ray-actor `vLLMHttpServer` boundary instead of calling vLLM as an in-process library.
+- Compare vLLM vs SGLang adapters: what's identical (BaseRollout contract), what diverges (radix cache vs PagedAttention block manager), and why veRL supports both.
+- Describe `update_weights()` end-to-end: how trained actor weights reach the rollout engine without a full model checkpoint roundtrip (bucketed/chunked transfer, why).
+- Explain MoE `routed_experts` handling: why rollout must return expert routing info and what the training side does with it.
+- Justify the `sleep(level=1)` vs `sleep(level=2)` choice from the rollout's perspective — what state survives each level.
+- Predict what breaks if rollout TP size ≠ actor TP size (and explain how `sharding_manager` bridges it).
+
 ---
 
 ## M5 — Memory Orchestration: Sleep / Wake / Offload **[critical]** (~4 h)
@@ -177,6 +200,14 @@ bcb63864), sharding_manager data resharding across FSDP+Ulysses.
 
 **Skip**: NPU-specific memory paths unless directly relevant.
 
+**Acceptance — you've understood M5 when you can:**
+- Draw the 4-phase timeline (training / pre-rollout / rollout / post-rollout) and label which tensors live on GPU vs CPU at each phase.
+- Explain `sleep_level=1` vs `sleep_level=2` matrix: what each level releases, when you'd pick which (KV cache only vs weights+KV), and the wake-up cost difference.
+- Trace `update_weights()` line by line: who initiates, who does FSDP all-gather, how the named tensor stream gets to the rollout actor, when the actor releases its training-side copy.
+- Explain why `aggressive_empty_cache` is needed beyond `torch.cuda.empty_cache()` — what fragmentation pattern triggers OOM that the standard call misses.
+- Justify offloading the *optimizer* (not just weights) before rollout — what fraction of memory it actually frees for a 7B Adam model.
+- Identify the colocation invariant that makes the whole sleep/wake dance worth it (vs separate actor + rollout GPU pools): GPU $ savings, what you give up.
+
 ---
 
 ## M6 — FSDP / Engine Worker Internals **[core]** (~4 h)
@@ -193,6 +224,14 @@ backend registry pattern (FSDP/Megatron/TorchTitan/VeOmni), loss computation
 trace, rationale for migration from legacy to engine-based workers.
 
 **Skip**: `verl/workers/megatron_workers.py` (1316 LOC, deprecated path).
+
+**Acceptance — you've understood M6 when you can:**
+- Map the backend registry: how a config string (`fsdp` / `megatron` / `torchtitan` / `veomni`) routes to a concrete `TrainingWorker` implementation.
+- Trace `actor_wg.step(batch)` from worker entry to the PPO loss tensor: forward → log-prob → ratio → clip → loss → backward → optimizer step.
+- Explain the migration motivation from `fsdp_workers.py` (legacy) to `engine_workers.py` (modern) — what the new abstraction lets veRL do that the old one couldn't.
+- Justify gradient checkpointing on/off trade for a 7B Qwen at the configured micro-batch size.
+- Explain `use_remove_padding=True`: how variable-length sequences are packed and what it saves vs naive padding.
+- Identify where Ulysses sequence parallelism plugs in and what kind of sequence length it's needed for.
 
 ---
 
@@ -212,6 +251,14 @@ that costs.
 
 **Skip**: `teacher_loop` unless distillation becomes a direct focus.
 
+**Acceptance — you've understood M7 when you can:**
+- Sketch the GPU-utilization timeline for sync vs async vs fully-async mode and show where the bubbles disappear.
+- Explain TransferQueue: what zero-copy property it guarantees, who is producer/consumer, where it sits between rollout and training.
+- Identify the synchronization barriers `main_ppo_sync.py` removes vs the ones it must keep (gradient sync, KL ref alignment).
+- Explain `AgentLoopManager`: how it streams partial rollouts back to training before all sequences finish.
+- Articulate the staleness trade-off in fully-async PPO — how many policy versions of drift are tolerated, and what corrects for it (importance ratio, KL).
+- Predict which workload shape (long-tail responses vs uniform) benefits most from async mode and why.
+
 ---
 
 ## M8 — Recipes & Training Variants **[optional]** (~2 h)
@@ -230,12 +277,22 @@ override structure). Not exhaustive per-recipe coverage.
 **Skip**: GVPO, spin, rep_exp, prime, gkd unless a specific question drags
 them in.
 
+**Acceptance — you've understood M8 when you can:**
+- Describe the recipe extension pattern in one paragraph: which base classes you subclass, which config blocks you override, what stays untouched.
+- Explain why DAPO needs a decoupled actor-policy and what concrete code change makes that possible (vs vanilla PPO).
+- Predict where you'd add a new `MyRLAlgo` recipe — list the 3-5 files you'd touch.
+
 ---
 
 ## M9 — Megatron Backend & Distillation **[optional]** (~3 h, skip unless needed)
 
 - `verl/workers/megatron_workers.py` — deprecated for v0.8.0
 - `verl/experimental/teacher_loop/` — streaming teacher for distillation
+
+**Acceptance — you've understood M9 when you can:**
+- Explain why the Megatron path was deprecated in favor of the engine-based abstraction (maintenance burden, TP/PP coupling).
+- Describe `teacher_loop` at the contract level: what the teacher emits, what the student consumes, where logits are matched.
+- Justify whether distillation belongs in this repo at all, or as a downstream consumer.
 
 ---
 

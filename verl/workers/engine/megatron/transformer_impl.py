@@ -73,6 +73,61 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class MegatronEngine(BaseEngine):
+    """
+    BaseEngine implementation backed by NVIDIA Megatron-LM 3D parallelism (TP + PP + DP).
+
+    What:
+
+    - Wraps Megatron-Core (mcore) GPTModel under verl's BaseEngine protocol so that
+      actor / critic / reward workers can drive training and forward passes through a
+      uniform interface (initialize / train_mode / eval_mode / forward_backward_batch /
+      optimizer_step / lr_scheduler_step / shard_data / unshard_data).
+    - Owns the distributed device mesh (TP x PP x CP x DP), the mcore DistributedOptimizer,
+      the megatron-style LR scheduler, and param/grad/optimizer offload bookkeeping.
+
+    Lifecycle:
+
+    - __init__ builds the mesh and offload flags; initialize() constructs the mcore
+      model(s) (VPP chunks), optimizer, and scheduler.
+    - train_mode / eval_mode are context managers that toggle grad + activation recompute
+      and bring params/optimizer back on-device.
+
+    Called by:
+
+    - EngineRegistry.new(..., strategy="megatron") via verl/workers/engine/base.py.
+    - TrainingWorker in verl/workers/engine/engine_workers.py composes this engine into
+      actor/critic roles.
+
+    Call graph (THIS ENTITY):
+
+    - forward_backward_batch -> mcore get_forward_backward_func() -> 1F1B schedule over
+      PP stages -> per-microbatch forward_step + backward -> TP allreduce inside the
+      wrapped GPTModel (not visible in this file).
+    - optimizer_step -> DistributedOptimizer.step (ZeRO-style optimizer-state shard).
+
+    Branches:
+
+    - TP size > 1 activates column/row-parallel linears inside the model; = 1 is plain DP.
+    - PP size > 1 switches forward_backward_batch onto the 1F1B interleaved schedule;
+      = 1 collapses to a single-stage fwd+bwd loop.
+    - forward_only=True (compute_log_prob / reward) skips backward + optimizer.step;
+      train path (update_policy / update_critic) runs full fwd+bwd+step.
+    - Context Parallel / Ulysses SP shard the sequence dim when cp_size > 1.
+    - LM-head vs value-head behavior lives in MegatronEngineWithLMHead /
+      MegatronEngineWithValueHead subclasses.
+
+    Why:
+
+    - Chosen when strategy="megatron" for 70B+ models where TP and PP are mandatory to
+      fit params + activations.
+    - forward_backward_batch drives the whole pipeline, not just a single micro-batch,
+      because the 1F1B schedule interleaves forwards and backwards across PP stages
+      (Megatron-LM 2021 Sec. 4).
+    - TP allreduce sits inside attention/MLP in the model code (Shoeybi 2019 Sec. 3).
+    - DistributedOptimizer gives ZeRO-style optimizer-state sharding across the DP group,
+      which is what unlocks 70B+ training on limited HBM.
+    """
+
     def __init__(
         self,
         model_config: HFModelConfig,

@@ -69,6 +69,19 @@ class AsyncRolloutRequestStateEnum(str, Enum):
     TOOL_CALLING = "tool_calling"
 
 
+# Modes for the train/inference tokenization consistency check run at finalize():
+#
+#   - DISABLE:            Skip the check entirely. Cheapest; use when you fully trust
+#                         the chat template and engine tokenizer to agree, or during
+#                         perf benchmarking where the extra re-tokenization cost matters.
+#   - STRICT:             Any byte-level diff between the incrementally-built input_ids
+#                         and the one-shot HF chat-template re-tokenization is warned.
+#                         Appropriate during chat-template development / debugging
+#                         tool-calling templates, where silent shifts are the real risk.
+#   - IGNORE_STRIPPABLE:  Only warn when diffs contain non-whitespace content. Tolerates
+#                         benign trailing-newline / whitespace variations between SGLang
+#                         and HF tokenization while still catching semantic drift.
+#                         Recommended default for production multi-turn training.
 class TokenizationSanityCheckModeEnum(str, Enum):
     """The enum for tokenization sanity check mode."""
 
@@ -78,7 +91,56 @@ class TokenizationSanityCheckModeEnum(str, Enum):
 
 
 class AsyncRolloutRequest(BaseModel):
-    """The data model for async rollout."""
+    """Per-request data model carrying state across the async multi-turn rollout loop.
+
+    What:
+
+      - Holds the full lifecycle of a single rollout: the growing token tape
+        (input_ids / attention_mask / position_ids / loss_mask), the parallel
+        message-level view (`messages`), optional multi-modal tensors, tool
+        schemas / kwargs, sampling & length caps, and a state enum.
+      - Acts as both input (prompt tokenization, tool definitions) and output
+        (response_ids and associated masks) for the async rollout worker.
+
+    Lifecycle:
+
+      - Constructed PENDING by AgentLoop / SGLang rollout worker from a raw
+        chat (messages + tool_schemas). `initialize_request` runs HF
+        apply_chat_template once to seed prompt_ids and pre-compute the two
+        BASE_CHAT_HISTORY anchor offsets used later to slice per-turn deltas.
+      - Transitions PENDING -> RUNNING -> {TOOL_CALLING | INTERACTING} -> RUNNING
+        as the engine emits tokens and tools respond; terminates in COMPLETED
+        (via `finalize`) or FAILED.
+      - Each turn appends to the tape via `_update_input_ids`; `finalize`
+        splits the tape into prompt_ids / response_ids at the original prompt
+        boundary, runs the tokenization sanity check, and truncates to caps.
+
+    Call graph:
+
+      - Called by: verl/workers/rollout/sglang_rollout/* AgentLoop driver
+        and other async rollout engines within verl/workers/rollout.
+      - Calls into: HF processing_class.apply_chat_template, qwen2vl
+        get_rope_index, difflib SequenceMatcher (for sanity diff).
+
+    Why pydantic:
+
+      - Rollouts are serialized across Ray actors (rollout worker <-> driver);
+        pydantic gives validation + clean model_dump for Ray transport, while
+        `arbitrary_types_allowed=True` lets torch.Tensor fields pass through.
+      - `model_validator(mode="before")` centralizes the one-time chat-template
+        tokenization so every downstream method can rely on prompt_ids and
+        anchor offsets being populated.
+
+    Boundary-validation pattern:
+
+      - Tokenize-once-per-turn + diff-on-seam: instead of re-tokenizing the
+        entire conversation each turn (O(N^2) and mismatches inference
+        tokenization), each turn tokenizes only the delta against a fixed
+        BASE_CHAT_HISTORY anchor and appends. At finalize time, we re-run the
+        full HF chat template once and diff it against the accumulated tape to
+        catch silent drift between training-side and inference-side
+        tokenization.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -121,6 +183,35 @@ class AsyncRolloutRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def initialize_request(cls, values):
+        """Seed prompt_ids, masks, and the two BASE_CHAT_HISTORY anchor offsets.
+
+        What:
+
+          - Runs exactly once at construction. Converts raw dicts into Message
+            objects, applies the HF chat template twice (with and without the
+            generation prompt suffix) to recover `generation_prompt_ids`, and
+            pre-tokenizes BASE_CHAT_HISTORY with/without generation prompt to
+            record `base_conv_wo_gen_prompt_end_pos` and
+            `base_conv_with_gen_prompt_end_pos`.
+
+        Why the two anchor offsets:
+
+          - Later per-turn methods (`add_user_message`, `add_assistant_message`,
+            `add_tool_response_messages`) prepend BASE_CHAT_HISTORY to isolate
+            just the new turn's tokens, then slice past the anchor offset to
+            extract the delta. This avoids re-tokenizing the whole growing
+            conversation and keeps per-turn work O(turn size) instead of
+            O(total length).
+
+        Branches:
+
+          - multi_modal_keys default to image/video when absent; multi_modal
+            tensors go through ProcessorMixin path, pure text through the
+            plain tokenizer path.
+          - If caller already provided input_ids/attention_mask/position_ids
+            (e.g., pre-tokenized prompt), the chat-template step is skipped
+            and we just promote them to prompt_*.
+        """
         if not (messages := values.get("messages")):
             raise ValueError("messages is required for AsyncRolloutRequest initialization")
         if not (max_prompt_len := values.get("max_prompt_len")):
@@ -346,10 +437,27 @@ class AsyncRolloutRequest(BaseModel):
     def get_generation_prompt_ids(
         self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
     ) -> list[int]:
-        """
-        Get the generation prompt ids for rollout engine.
+        """Get the generation prompt ids for rollout engine.
 
         Because rollout engine(SGLang) requires the ids to be a list, we need to convert the tensor to a list.
+
+        What / Why:
+
+          - Two modes depending on `use_inference_chat_template`:
+            * False (default, training-consistent): return the already-built
+              `input_ids` list. The engine continues from exactly the token
+              sequence training supervision will align against.
+            * True (engine-consistent): re-apply the chat template on the
+              current messages via the engine's tokenizer so the engine sees
+              the same prompt it would in standalone serving. Useful when
+              matching inference-time behavior matters more than training
+              alignment.
+
+        Lifecycle:
+
+          - If the tape does not already end in `generation_prompt_ids`, they
+            are appended first (attention_mask=True, loss_mask=False) so the
+            assistant turn has a clean "it's your turn" suffix.
         """
         generation_prompt_ids = (
             None
@@ -414,6 +522,34 @@ class AsyncRolloutRequest(BaseModel):
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
         contents: list[ToolResponse],
     ) -> None:
+        """Append one or more `role=tool` messages to the tape after a tool call.
+
+        What:
+
+          - Converts each ToolResponse (text and/or image/video) into a
+            Message, tokenizes just the delta by prepending BASE_CHAT_HISTORY
+            and slicing past `base_conv_wo_gen_prompt_end_pos`, then appends
+            to input_ids / attention_mask / position_ids with loss_mask=False
+            (tool outputs are context, not supervision targets).
+
+        Lifecycle:
+
+          - Called from the TOOL_CALLING branch of the async loop after the
+            tool executes. Before appending, `_remove_generation_prompt_ids_if_present`
+            strips any trailing assistant-generation-prompt tokens the chat
+            template emitted, so tool tokens slot in cleanly and the next
+            assistant turn re-adds the generation prompt.
+
+        Branches:
+
+          - Text-only contents -> plain Message with string content.
+          - Multi-modal contents -> content list of {type: image/video/text}
+            entries; image/video payloads are accumulated into
+            `delta_multi_modal_data` and merged into `multi_modal_data` /
+            `multi_modal_inputs`.
+          - Early-return when all contents are empty to avoid polluting the
+            tape with a zero-delta tokenization.
+        """
         if not contents or all(content.is_empty() for content in contents):
             return
         # We also handle the case when tool returns image
@@ -552,6 +688,46 @@ class AsyncRolloutRequest(BaseModel):
         reward_scores: dict[str, list[float]],
         finish_reason_type: FinishReasonTypeEnum = FinishReasonTypeEnum.STOP,
     ) -> None:
+        """Terminal transition: split prompt/response, run sanity check, truncate.
+
+        What:
+
+          - Marks the request COMPLETED, strips any trailing generation-prompt
+            tokens left over from a failed assistant turn, and materializes
+            `response_ids` as the slice past the original prompt boundary.
+          - Runs `tokenization_sanity_check_mode` gated verification: re-applies
+            the full HF chat template to all accumulated messages and diffs
+            against the incrementally-built `input_ids`.
+          - Finally calls `truncate_output_ids` to enforce max_model_len /
+            max_response_len caps on all four parallel tensors.
+
+        Why the sanity check exists (fail-loud design):
+
+          - Training-side tokenization uses the HF chat template applied
+            turn-by-turn; inference-side (SGLang/vLLM) may apply its own chat
+            template or tokenize free-form text emitted by the model. When the
+            two templates disagree on whitespace, BOS/EOS, or tool-call
+            framing, the loss_mask silently misaligns with input_ids -- the
+            model trains on the wrong tokens and the bug is invisible except
+            as degraded rewards.
+          - `_get_prompt_diffs` uses difflib.SequenceMatcher on decoded text
+            (not token IDs) so we can show humans exactly where the chat
+            template drifts, with surrounding-char context.
+
+        Branches:
+
+          - DISABLE -> skip the re-tokenization entirely.
+          - STRICT -> any diff logs a warning.
+          - IGNORE_STRIPPABLE -> only non-whitespace diffs warn; tolerates
+            benign trailing-newline divergence between engines.
+          - Multi-modal mismatch between accumulated and full-prompt tensors
+            is always warned (independent of mode).
+
+        Called by:
+
+          - Async rollout worker once the engine returns a STOP/LENGTH finish
+            reason or the loop hits a tool/interaction cap.
+        """
         self.state = AsyncRolloutRequestStateEnum.COMPLETED
         self.reward_scores = reward_scores
 

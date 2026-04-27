@@ -72,13 +72,78 @@ class WorkerHelper:
         return self._get_node_ip().strip("[]"), str(self._get_free_port())
 
 
-# we assume that in each WorkerGroup, there is a Master Worker
 class Worker(WorkerHelper):
-    """A distributed worker that handles initialization and configuration for distributed training.
+    """What: A distributed worker that handles initialization and configuration for distributed training.
 
     This class manages worker initialization, configuration, and provides methods for executing
     distributed operations. It handles communication settings, device configuration, and worker
     metadata management.
+
+    We assume that in each WorkerGroup, there is a Master Worker.
+
+      - Base class every user worker (ActorRolloutRefWorker, CriticWorker, RewardModelWorker,
+        MegatronWorker, FusedWorker, CheckpointEngineWorker, EnvWorker...) subclasses.
+      - __init__ bootstraps rank / world_size / local_rank / master_addr / master_port and
+        {CUDA,HIP,ROCR,NPU}_VISIBLE_DEVICES from env vars injected by RayWorkerGroup.
+      - Initializes per-mesh tables __dispatch_dp_rank / __collect_dp_rank so downstream
+        code can ask "what's my DP rank inside mesh X?" without re-parsing env every call.
+      - _register_dispatch_collect_info / _query_dispatch_info expose the publish-lookup pair.
+
+    Lifecycle:
+      - Runs INSIDE each Ray actor process, once per rank, at actor startup.
+      - RayWorkerGroup._init_with_resource_pool first injects env vars (WORLD_SIZE, RANK,
+        MASTER_ADDR/PORT, *_VISIBLE_DEVICES) into the actor, then ray_cls_with_init()
+        instantiates the subclass, whose super().__init__() lands here.
+      - After __init__, the subclass typically calls _register_dispatch_collect_info(
+        mesh_name, dp_rank, is_collect) for each logical mesh (actor / rollout / critic)
+        it participates in; the driver later calls _query_dispatch_info(mesh_name) via
+        Dispatch.ONE_TO_ALL to read those mappings back.
+
+    Called by:
+      - Subclassed by MegatronWorker (verl/workers/megatron_workers.py),
+        ActorRolloutRefWorker / CriticWorker / RewardModelWorker
+        (verl/workers/fsdp_workers.py), CheckpointEngineWorker
+        (verl/checkpoint_engine/base.py), EnvWorker
+        (verl/experimental/vla/workers/env/env_worker.py), FusedWorker
+        (verl/single_controller/ray/base.py).
+      - Instantiated on the Ray side by RayClassWithInitArgs.__call__ inside each actor.
+
+    Call graph:
+      run_qwen2-7b.sh                                  [layer: launch shell]
+        -> verl/trainer/main_ppo.py::main              [layer: entry]
+          -> TaskRunner.run  (ray remote)              [layer: driver actor]
+            -> RayPPOTrainer.init_workers              [layer: trainer]
+              -> RayWorkerGroup.__init__
+                 -> _init_with_resource_pool           [layer: dispatch]
+                    -> RayClassWithInitArgs.__call__   [layer: ray rpc]
+                       -> (Ray spawns actor process)
+                          -> UserWorker.__init__       [layer: workers]
+                             -> WORKER.__INIT__        <-- THIS ENTITY [layer: workers]
+                                -> _setup_env_cuda_visible_devices
+                                -> _configure_with_store (populates env + self.__dict__)
+
+    Branches:
+      - HIP_VISIBLE_DEVICES set -> migrated to CUDA_VISIBLE_DEVICES for consistency; mismatch
+        with an existing CUDA_VISIBLE_DEVICES raises.
+      - ROCR_VISIBLE_DEVICES set -> moved to CUDA_VISIBLE_DEVICES; conflict with HIP/CUDA
+        raises (ROCR semantics differ from HIP, so we fail closed).
+      - ray_noset_visible_devices() true -> read LOCAL_RANK from Ray accelerator ids and call
+        torch.{cuda,npu}.set_device; used when RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is on.
+      - cuda_visible_devices kwarg provided -> injected into store before _configure_with_store
+        so subclasses can override env pinning from Python.
+
+    Why:
+      - HybridFlow §3 single-controller-multi-worker abstraction. Each Ray actor is an SPMD
+        rank; the driver needs a uniform way to tell every rank "you are rank R of W in mesh
+        M with DP index D". Worker.__init__ is that uniform entry point.
+      - Storing __dispatch_dp_rank / __collect_dp_rank on self (rather than re-deriving from
+        env each time) is what lets Dispatch.DP_COMPUTE_PROTO on the driver scatter a
+        DataProto batch into the correct shards: the driver calls _query_dispatch_info once
+        per mesh and caches the rank->dp_rank table used to index into batches.
+      - Env-var-first bootstrap (rather than passing everything through __init__ kwargs)
+        is deliberate: torchrun-style distributed init, FSDP, and NCCL all read the same
+        WORLD_SIZE/RANK/MASTER_* vars, so the subclass gets a torch-native environment for
+        free once super().__init__() returns.
     """
 
     fused_worker_attr_name = "fused_worker_dict"

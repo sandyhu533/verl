@@ -580,6 +580,42 @@ class SGLangHttpServer:
 
 
 class SGLangReplica(RolloutReplica):
+    """Ray-level orchestrator for a single SGLang rollout replica (analog of vLLMReplica).
+
+    What:
+      - Concrete RolloutReplica subclass that owns one logical inference "replica"
+        (= one tp/pp/dp group) spanning `nnodes` physical Ray nodes.
+      - Wraps SGLangHttpServer as a Ray actor (one actor per node) and brings the
+        replica up via launch_servers(); the trainer then talks to the replica
+        through the HTTP address exposed by node_rank==0.
+
+    Why:
+      - SGLang's inference internals (radix prefix cache per SGLang paper, the
+        ORCA-style iteration-level scheduler inside TokenizerManager/Scheduler)
+        differ substantially from vLLM's PagedAttention block manager. But the
+        RolloutReplica contract — launch_servers / sleep / wake_up / update_weights
+        driven by ray_trainer.py and AgentLoop — is identical across backends, so
+        the trainer-side code path is unchanged when swapping engines.
+
+    Lifecycle:
+      - Constructed by replica.get_rollout_replica_class("sglang")(...) (see
+        verl/workers/rollout/replica.py) during RayPPOTrainer.init_workers.
+      - launch_servers() is awaited before the trainer starts rollouts.
+      - sleep()/wake_up() flip KV + (optionally) weights between GPU and CPU so
+        the rollout and actor-train FSDP workers can time-share GPU memory in
+        HYBRID colocation (HybridFlow §4 3D-HybridEngine).
+
+    Called by:
+      - verl/workers/rollout/replica.py::get_rollout_replica_class (factory).
+      - Indirectly by verl/trainer/ppo/ray_trainer.py and AgentLoop paths.
+
+    Branches:
+      - is_reward_model / is_teacher_model / default -> distinct actor-name prefix
+        so multiple replica types coexist in one Ray cluster.
+      - rollout_mode (HYBRID / COLOCATED / STANDALONE) is forwarded to the per-node
+        SGLangHttpServer and controls sleep/wake memory tag sets.
+    """
+
     def __init__(
         self,
         replica_rank: int,
@@ -593,10 +629,46 @@ class SGLangReplica(RolloutReplica):
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
+        # Wrap SGLangHttpServer as a Ray remote class here (not at module import)
+        # so that each replica can later materialize one actor per node with its
+        # own NodeAffinity + CUDA_VISIBLE_DEVICES runtime env.
         self.server_class = ray.remote(SGLangHttpServer)
 
     async def launch_servers(self):
-        """Launch http server in each node."""
+        """Launch one SGLangHttpServer Ray actor per node and start its HTTP server.
+
+        What:
+          - Pin one SGLangHttpServer actor to each physical node that hosts a
+            slice of this replica via NodeAffinitySchedulingStrategy, passing in
+            the union of that node's FSDP-worker CUDA_VISIBLE_DEVICES so SGLang
+            can re-initialize NCCL on the same GPUs the training workers use
+            (required for HYBRID colocation — same process group, same device set).
+          - For multi-node replicas, node_rank==0 picks a free master_address/port
+            and broadcasts it; peer nodes use it to rendezvous via dist_init_addr.
+          - Finally await launch_server.remote() on all per-node actors in parallel
+            and cache the rank-0 actor's HTTP endpoint as the replica's public address.
+
+        Called by:
+          - RolloutReplica.init_*() flow (init_hybrid / init_colocated / init_standalone
+            in verl/workers/rollout/replica.py), right after the FSDP worker group
+            is ready.
+
+        Branches:
+          - RAY_EXPERIMENTAL_NOSET_{VD} set -> compute base_gpu_id ourselves since
+            Ray is not isolating CUDA_VISIBLE_DEVICES per-actor.
+          - nnodes > 1 -> pre-negotiate master_address/port on rank-0.
+          - is_reward_model / is_teacher_model -> distinct actor name for registry.
+
+        Why:
+          - Node affinity + inherited CUDA_VISIBLE_DEVICES is how the trainer-side
+            FSDP ranks and the rollout-side SGLang workers end up on the *same*
+            GPUs (HybridFlow 3D-HybridEngine colocation). Without this, the two
+            engines would not be able to swap weights / KV in place.
+          - Only rank-0's HTTP port is exposed because SGLang funnels all HTTP
+            traffic through its single TokenizerManager (ORCA-style centralized
+            iteration scheduler); peer nodes run the scheduler/worker subprocesses
+            only.
+        """
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )

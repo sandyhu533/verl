@@ -62,6 +62,45 @@ class ServerAdapter(BaseRollout):
     """
     vLLM server adapter used in native async mode, serve as a client to request vLLM server
     to resume/release/update weights and kv_cache.
+
+    What:
+      - Thin sync-style CLIENT that drives a remote vLLM async-engine SERVER actor
+        (spawned by vLLMReplica) over Ray RPC. Implements the BaseRollout four-method
+        API (generate_sequences / update_weights / resume / release).
+      - Sibling file: vllm_async_server.py hosts the matching `collective_rpc` server
+        that terminates the RPCs dispatched from here.
+
+    Lifecycle:
+      - __init__ computes this worker's (replica_rank, rollout_rank, node_rank) from
+        RANK/RAY_LOCAL_WORLD_SIZE and the (TP * DP * PP) rollout group size; the Ray
+        actor handle to the server is resolved lazily on first _execute_method call
+        (server is launched AFTER the hybrid engine so it is not addressable at ctor
+        time).
+      - Per training step: SharingManager.__enter__ -> update_weights (reshard from
+        FSDP/Megatron trainer into vLLM) -> resume(kv_cache) -> rollout ->
+        release() -> SharingManager.__exit__.
+
+    Call graph:
+      - Upward: vLLMReplica / AsyncLLMServerManager and RayPPOTrainer's rollout phase.
+      - Downward: ray.actor -> vllm_async_server.AsyncvLLMServer.collective_rpc ->
+        vllm.AsyncLLMEngine.collective_rpc -> per-GPU worker methods
+        (wake_up/sleep/update_weights_from_ipc). Bulk weight tensors bypass Ray and
+        travel via a per-device ZMQ IPC socket driven by BucketedWeightSender.
+
+    Why:
+      - vLLM runs in-process as a library (not an external HTTP server) so the
+        HybridEngine (HybridFlow S4) can COLOCATE training and rollout on the same
+        GPUs and avoid keeping 2x model copies in HBM. sleep/wake (PagedAttention
+        SOSP'23 KV-release semantics) frees the KV cache and optionally weights
+        between phases.
+      - Weight reshard (trainer sharding -> rollout TP sharding) goes over CUDA IPC
+        handles bucketed through ZMQ rather than Ray object store: zero-copy GPU<->GPU
+        on the same host, avoids pickling multi-GB tensors, and lets the server-side
+        worker pull just its TP shard. Falls back to /dev/shm when IPC is unavailable
+        (e.g. Ascend NPU without CANN >= 8.3.RC1).
+      - Only rollout_rank 0 issues the RPC; the server's collective_rpc fans out to
+        all TP/PP workers. This keeps the client SPMD-safe while the engine stays
+        collective internally.
     """
 
     def __init__(
@@ -71,6 +110,32 @@ class ServerAdapter(BaseRollout):
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
     ):
+        """
+        What:
+          - Compute rank coordinates inside the rollout replica and pick the ZMQ
+            endpoint / sleep level used for the lifetime of this adapter.
+
+        Lifecycle:
+          - Constructed once per rollout worker when vLLMReplica binds a BaseRollout;
+            server_handle is resolved LAZILY in _execute_method because the vLLM
+            async server actor is launched after the hybrid engine is up.
+
+        Branches:
+          - replica_rank defaults to (global rank // rollout_world_size); override
+            honored when the caller already knows the replica index.
+          - sleep_level=1 is forced when layered_summon is set or when expert
+            parallelism is on with an old vLLM (< 0.11.0, see vllm issue #25171).
+            Otherwise uses VLLM_SLEEP_LEVEL (typically 2 = also drop weights).
+          - use_shm=True when the device runtime cannot expose CUDA IPC handles
+            (non-CUDA or older Ascend CANN); bulk weight transfer then falls back
+            to shared memory via BucketedWeightSender.
+
+        Why:
+          - One ZMQ socket per physical device (keyed by device UUID) so multiple
+            colocated replicas on the same host do not collide, and so the sender
+            in the trainer process and the receiver in the vLLM worker process can
+            find each other without going through Ray.
+        """
         super().__init__(config, model_config, device_mesh)
         self.server_handle: ray.actor.ActorHandle = None
 
@@ -132,6 +197,36 @@ class ServerAdapter(BaseRollout):
 
         Returns:
             The result of the method execution, or None if non_block=True.
+
+        What:
+          - Generic RPC dispatch: forwards a named method + args to the vLLM async
+            server actor, which internally calls engine.collective_rpc to fan out
+            to every TP/PP worker inside the engine.
+
+        Lifecycle:
+          - First call resolves the named Ray actor
+            `{prefix}server_{replica_rank}_{node_rank}` and caches the handle. The
+            server is created by vLLMReplica after the hybrid engine has
+            initialized, so this lazy lookup is load-bearing.
+
+        Call graph:
+          - resume / release / update_weights -> _execute_method(method, ...)
+            -> ray actor .collective_rpc.remote(...) -> vllm_async_server
+            .collective_rpc -> vllm AsyncLLMEngine.collective_rpc -> per-worker
+            method (wake_up/sleep/update_weights_from_ipc/clear_kv_cache).
+
+        Branches:
+          - rollout_rank != 0 returns None: avoids N identical SPMD callers all
+            issuing the same collective; only the group leader talks to the server.
+          - non_block=True returns the awaitable so the caller can overlap RPC
+            round-trip with work that must happen first on the client side (see
+            update_weights: server is told to start receiving BEFORE the sender
+            begins pushing tensors on ZMQ).
+
+        Why:
+          - Single chokepoint keeps the Ray boundary narrow and makes RPC method
+            names (strings) the contract with the server-side dispatcher, letting
+            vLLM internals evolve without the trainer importing vLLM symbols.
         """
         if self.rollout_rank != 0:
             return None
@@ -149,12 +244,50 @@ class ServerAdapter(BaseRollout):
 
         Args:
             tags: weights or kv_cache.
+
+        What:
+          - Wake the vLLM engine: re-allocate the tagged GPU buffers (weights and/or
+            paged-KV blocks) that were freed by release()/sleep().
+
+        Lifecycle:
+          - Called by the rollout sharding manager when the hybrid engine transitions
+            from training to rollout. Typical order within update_weights flow:
+            resume(["weights"]) -> update_weights -> resume(["kv_cache"]).
+
+        Branches:
+          - Guarded by free_cache_engine: when colocation is disabled vLLM owns HBM
+            full-time and there is nothing to wake.
+
+        Why:
+          - Implements the rollout half of HybridEngine memory time-sharing (vLLM
+            SOSP'23 KV-cache release / HybridFlow S4). Weights and KV blocks are
+            reclaimed for training and returned for generation instead of reserving
+            both concurrently.
         """
         if self.config.free_cache_engine:
             await self._execute_method("wake_up", kwargs={"tags": tags})
 
     async def release(self):
-        """Release weights and kv cache in GPU memory."""
+        """Release weights and kv cache in GPU memory.
+
+        What:
+          - Put the vLLM engine to sleep: free KV blocks and (at level 2) also the
+            weight tensors so training can reclaim HBM.
+
+        Lifecycle:
+          - Called by the sharding manager when leaving the rollout phase.
+
+        Branches:
+          - sleep_level = VLLM_SLEEP_LEVEL (2) normally -> drop weights + KV.
+          - sleep_level = 1 when layered_summon or EP>1 on vLLM <0.11.0 -> keep
+            weights, drop KV only (trade HBM for fewer weight reloads).
+
+        Why:
+          - Pair to resume(). This is the training-side reclamation step of the
+            HybridEngine time-share: without it, vLLM would keep its PagedAttention
+            block pool reserved during the optimizer step, leaving no room for FSDP
+            full-parameter gather / Megatron activations.
+        """
         if self.config.free_cache_engine:
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})
 
@@ -162,7 +295,47 @@ class ServerAdapter(BaseRollout):
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers.
+
+        What:
+          - Reshard trainer-side weights (FSDP or Megatron TP/PP layout) into the
+            vLLM rollout's TP layout, handing them over through a bucketed
+            zero-copy channel instead of Ray object store.
+
+        Lifecycle:
+          - Entry point of the HybridEngine weight-reload path. Called by the
+            rollout sharding manager on every training step once the actor has
+            produced fresh weights.
+
+        Call graph:
+          - _execute_method("update_weights_from_ipc", non_block=True) primes the
+            server-side receiver on all TP workers.
+          - BucketedWeightSender.async_send_weights(weights) streams (name, tensor)
+            pairs over ZMQ using CUDA IPC handles (or /dev/shm fallback), grouped
+            into `update_weights_bucket_megabytes`-sized buckets to amortize
+            per-message overhead.
+          - await future: barrier — wait until every TP worker has ingested its
+            shard before releasing the generator.
+          - rollout_rank 0 then RPCs clear_kv_cache (prefix cache is invalidated
+            because weights changed) and set_global_steps for telemetry.
+
+        Branches:
+          - use_shm toggles the transport mode; the server also receives this flag
+            so sender and receiver agree.
+          - global_steps is optional (skipped for cold eval paths).
+
+        Why:
+          - HybridFlow S4 3D-HybridEngine: trainer and rollout have DIFFERENT
+            parallelism geometries, so weights must be reassembled (all-gather
+            along trainer's TP, scatter along rollout's TP) each step. Doing this
+            via CUDA IPC + ZMQ keeps the transfer on-device, avoids pickling
+            multi-GB tensors through Ray, and lets the rollout worker pull exactly
+            its shard. Bucketing is the throughput knob: too small => ZMQ overhead
+            dominates; too large => tail latency + HBM spike on the receiver.
+          - Prefix-cache reset is mandatory: radix blocks are indexed by KV
+            contents which depend on the old weights; reusing them after an
+            update would produce silently wrong logits.
+        """
         start_time = time.time()
 
         future = await self._execute_method(
@@ -204,6 +377,23 @@ class ServerAdapter(BaseRollout):
 
         Raises:
             NotImplementedError: Always raised as sync generation is not supported.
+
+        What:
+          - Deliberately-disabled BaseRollout hook. ServerAdapter only speaks to an
+            async vLLM server, so DataProto -> SamplingParams -> engine.generate
+            -> DataProto batching must go through AsyncLLMServerManager instead.
+
+        Call graph:
+          - Expected async path: vLLMReplica owns this adapter for control-plane
+            ops; generation requests are routed per-request to the async server's
+            /generate endpoint by AsyncLLMServerManager.
+
+        Why:
+          - SPMD in-process generate() was retired in PR #4411; N-sample expansion
+            is already flattened to an n*B batch by the trainer before the rollout
+            phase, and the async server gives better request-level interleaving
+            (ORCA-style iteration-level scheduling) than a blocking ray.get on a
+            whole batch. Keeping this as a hard raise prevents silent fallback.
         """
         raise NotImplementedError(
             "ServerAdapter does not support synchronous generate_sequences(). "
